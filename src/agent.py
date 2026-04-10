@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-from .llms import DeepSeekLLM, OpenAILLM, BaseLLM
+from .llms import DeepSeekLLM, OpenAILLM, ZhipuLLM, BaseLLM
 from .nodes import (
     ReportStructureNode,
     FirstSearchNode, 
@@ -61,6 +61,11 @@ class DeepSearchAgent:
             return OpenAILLM(
                 api_key=self.config.openai_api_key,
                 model_name=self.config.openai_model
+            )
+        elif self.config.default_llm_provider == "zhipu":
+            return ZhipuLLM(
+                api_key=self.config.zhipu_api_key,
+                model_name=self.config.zhipu_model
             )
         else:
             raise ValueError(f"不支持的LLM提供商: {self.config.default_llm_provider}")

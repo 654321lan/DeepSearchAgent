@@ -1,5 +1,5 @@
-# Deep Search Agent 配置文件
-# 请在这里填入您的API密钥
+# Deep Search Agent 配置文件模板
+# 请复制此文件为 config.py 并填入您的API密钥
 
 # DeepSeek API Key
 DEEPSEEK_API_KEY = "your_deepseek_api_key_here"
@@ -7,13 +7,18 @@ DEEPSEEK_API_KEY = "your_deepseek_api_key_here"
 # OpenAI API Key (可选)
 OPENAI_API_KEY = "your_openai_api_key_here"
 
+# 智谱AI API Key
+ZHIPU_API_KEY = "your_zhipu_api_key_here"
+
 # Tavily搜索API Key
 TAVILY_API_KEY = "your_tavily_api_key_here"
 
 # 配置参数
-DEFAULT_LLM_PROVIDER = "deepseek"
+# LLM提供商选项: "deepseek", "openai", "zhipu"
+DEFAULT_LLM_PROVIDER = "zhipu"
 DEEPSEEK_MODEL = "deepseek-chat"
 OPENAI_MODEL = "gpt-4o-mini"
+ZHIPU_MODEL = "glm-4"
 
 MAX_REFLECTIONS = 2
 SEARCH_RESULTS_PER_QUERY = 3
