@@ -49,7 +49,7 @@ def main():
         "openai": "OpenAI"
     }
     PROVIDER_MODELS = {
-        "zhipu": ["glm-4", "glm-4-plus", "glm-4v"],
+        "zhipu": ["glm-4", "glm-4-plus", "glm-4v","glm-4.5-air"],
         "deepseek": ["deepseek-chat"],
         "openai": ["gpt-4o-mini", "gpt-4o"]
     }

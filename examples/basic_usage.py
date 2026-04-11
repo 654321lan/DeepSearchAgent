@@ -15,32 +15,66 @@ from src.utils.config import print_config
 
 def basic_example():
     """基本使用示例"""
+    import sys
+    if sys.platform == 'win32':
+        sys.stdout.reconfigure(encoding='utf-8')
+
     print("=" * 60)
-    print("Deep Search Agent - 基本使用示例")
+    print("Deep Search Agent - 基本使用示例 (适配智谱AI)")
     print("=" * 60)
-    
+
     try:
-        # 加载配置
+        # 导入配置文件中的变量
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+        from config import (
+            LLM_PROVIDER, ZHIPU_MODEL, OPENAI_MODEL, DEEPSEEK_MODEL,
+            ZHIPU_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, TAVILY_API_KEY,
+            MAX_SEARCH_RESULTS, SEARCH_TIMEOUT, MAX_CONTENT_LENGTH,
+            MAX_REFLECTIONS, MAX_PARAGRAPHS, OUTPUT_DIR, SAVE_INTERMEDIATE_STATE
+        )
+
+        # 手动创建配置对象
+        from src.utils.config import Config
+        config = Config(
+            deepseek_api_key=DEEPSEEK_API_KEY,
+            openai_api_key=OPENAI_API_KEY,
+            zhipu_api_key=ZHIPU_API_KEY,
+            tavily_api_key=TAVILY_API_KEY,
+            default_llm_provider=LLM_PROVIDER,
+            deepseek_model=DEEPSEEK_MODEL,
+            openai_model=OPENAI_MODEL,
+            zhipu_model=ZHIPU_MODEL,
+            max_search_results=MAX_SEARCH_RESULTS,
+            search_timeout=SEARCH_TIMEOUT,
+            max_content_length=MAX_CONTENT_LENGTH,
+            max_reflections=MAX_REFLECTIONS,
+            max_paragraphs=MAX_PARAGRAPHS,
+            output_dir=OUTPUT_DIR,
+            save_intermediate_states=SAVE_INTERMEDIATE_STATE
+        )
+
         print("正在加载配置...")
-        config = load_config()
         print_config(config)
-        
+
         # 创建Agent
         print("正在初始化Agent...")
         agent = DeepSearchAgent(config)
-        
+
         # 执行研究
         query = "2025年人工智能发展趋势"
         print(f"开始研究: {query}")
-        
+
         final_report = agent.research(query, save_report=True)
-        
+
         # 显示结果
         print("\n" + "=" * 60)
         print("研究完成！最终报告预览:")
         print("=" * 60)
         print(final_report[:500] + "..." if len(final_report) > 500 else final_report)
-        
+
         # 显示进度信息
         progress = agent.get_progress_summary()
         print(f"\n进度信息:")
@@ -48,14 +82,17 @@ def basic_example():
         print(f"- 已完成段落: {progress['completed_paragraphs']}")
         print(f"- 完成进度: {progress['progress_percentage']:.1f}%")
         print(f"- 是否完成: {progress['is_completed']}")
-        
+
     except Exception as e:
         print(f"示例运行失败: {str(e)}")
-        print("请检查：")
+        import traceback
+        traceback.print_exc()
+        print("\n请检查：")
         print("1. 是否安装了所有依赖：pip install -r requirements.txt")
         print("2. 是否设置了必要的API密钥")
         print("3. 网络连接是否正常")
         print("4. 配置文件是否正确")
+        print("5. ZHIPU_API_KEY是否已设置")
 
 
 if __name__ == "__main__":
