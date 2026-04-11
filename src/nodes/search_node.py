@@ -123,16 +123,16 @@ class FirstSearchNode(BaseNode):
 
 class ReflectionNode(BaseNode):
     """反思段落并生成新搜索查询的节点"""
-    
+
     def __init__(self, llm_client):
         """
         初始化反思节点
-        
+
         Args:
             llm_client: LLM客户端
         """
         super().__init__(llm_client, "ReflectionNode")
-    
+
     def validate_input(self, input_data: Any) -> bool:
         """验证输入数据"""
         if isinstance(input_data, str):
@@ -146,58 +146,68 @@ class ReflectionNode(BaseNode):
             required_fields = ["title", "content", "paragraph_latest_state"]
             return all(field in input_data for field in required_fields)
         return False
-    
+
     def run(self, input_data: Any, **kwargs) -> Dict[str, str]:
         """
         调用LLM反思并生成搜索查询
-        
+
         Args:
             input_data: 包含title、content和paragraph_latest_state的字符串或字典
             **kwargs: 额外参数
-            
+
         Returns:
             包含search_query和reasoning的字典
         """
         try:
             if not self.validate_input(input_data):
                 raise ValueError("输入数据格式错误，需要包含title、content和paragraph_latest_state字段")
-            
+
             # 准备输入数据
             if isinstance(input_data, str):
                 message = input_data
             else:
                 message = json.dumps(input_data, ensure_ascii=False)
-            
+
             self.log_info("正在进行反思并生成新搜索查询")
-            
+
             # 调用LLM
             response = self.llm_client.invoke(SYSTEM_PROMPT_REFLECTION, message)
-            
+
             # 处理响应
             processed_response = self.process_output(response)
-            
+
             self.log_info(f"反思生成搜索查询: {processed_response.get('search_query', 'N/A')}")
             return processed_response
-            
+
         except Exception as e:
             self.log_error(f"反思生成搜索查询失败: {str(e)}")
             raise e
-    
+
     def process_output(self, output: str) -> Dict[str, str]:
         """
         处理LLM输出，提取搜索查询和推理
-        
+
         Args:
             output: LLM原始输出
-            
+
         Returns:
             包含search_query和reasoning的字典
         """
         try:
+            # 提取推理过程（如果有额外文本）
+            reasoning_text = ""
+            if "推理过程：" in output or "推理分析：" in output:
+                # 提取推理部分
+                import re
+                reasoning_match = re.search(r'(推理过程[:：]|推理分析[:：])(.*?)(?=```json|\{)', output, re.DOTALL)
+                if reasoning_match:
+                    reasoning_text = reasoning_match.group(2).strip()
+                    self.log_info(f"[反思推理过程]\n{reasoning_text}")
+
             # 清理响应文本
             cleaned_output = remove_reasoning_from_output(output)
             cleaned_output = clean_json_tags(cleaned_output)
-            
+
             # 解析JSON
             try:
                 result = json.loads(cleaned_output)
@@ -206,19 +216,23 @@ class ReflectionNode(BaseNode):
                 result = extract_clean_response(cleaned_output)
                 if "error" in result:
                     raise ValueError("JSON解析失败")
-            
+
             # 验证和清理结果
             search_query = result.get("search_query", "")
             reasoning = result.get("reasoning", "")
-            
+
+            # 如果JSON中的reasoning为空但提取到了推理文本，使用提取的文本
+            if not reasoning and reasoning_text:
+                reasoning = reasoning_text[:500]  # 限制长度
+
             if not search_query:
                 raise ValueError("未找到搜索查询")
-            
+
             return {
                 "search_query": search_query,
                 "reasoning": reasoning
             }
-            
+
         except Exception as e:
             self.log_error(f"处理输出失败: {str(e)}")
             # 返回默认查询

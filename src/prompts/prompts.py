@@ -180,11 +180,19 @@ SYSTEM_PROMPT_REFLECTION = f"""
 
 你可以使用一个网络搜索工具，该工具接受'search_query'作为参数。
 你的任务是反思段落文本的当前状态，思考是否遗漏了主题的某些关键方面，并提供最佳的网络搜索查询来丰富最新状态。
-请按照以下JSON模式定义格式化输出：
+
+在输出JSON之前，请先进行**推理过程分析**：
+1. 分析当前段落已有的信息点
+2. 识别可能遗漏的关键方面（如背景、案例、数据、反面观点等）
+3. 确定需要补充搜索的主题
+
+然后请按照以下JSON模式定义格式化输出：
 
 <OUTPUT JSON SCHEMA>
 {json.dumps(output_schema_reflection, indent=2, ensure_ascii=False)}
 </OUTPUT JSON SCHEMA>
+
+注意：reasoning字段应包含你的推理过程分析，说明为什么要进行这个搜索查询。
 
 确保输出是一个符合上述输出JSON模式定义的JSON对象。
 只返回JSON对象，不要有解释或额外文本。
