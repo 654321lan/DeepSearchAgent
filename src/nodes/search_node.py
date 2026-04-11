@@ -6,9 +6,10 @@
 import json
 from typing import Dict, Any
 from json.decoder import JSONDecodeError
+import re
 
 from .base_node import BaseNode
-from ..prompts import SYSTEM_PROMPT_FIRST_SEARCH, SYSTEM_PROMPT_REFLECTION
+from ..prompts import SYSTEM_PROMPT_FIRST_SEARCH, SEARCH_QUERY_PROMPT, SYSTEM_PROMPT_REFLECTION
 from ..utils.text_processing import (
     remove_reasoning_from_output,
     clean_json_tags,
@@ -43,35 +44,41 @@ class FirstSearchNode(BaseNode):
     def run(self, input_data: Any, **kwargs) -> Dict[str, str]:
         """
         调用LLM生成搜索查询和理由
-        
+
         Args:
             input_data: 包含title和content的字符串或字典
             **kwargs: 额外参数
-            
+
         Returns:
             包含search_query和reasoning的字典
         """
         try:
             if not self.validate_input(input_data):
                 raise ValueError("输入数据格式错误，需要包含title和content字段")
-            
+
             # 准备输入数据
             if isinstance(input_data, str):
-                message = input_data
+                data = json.loads(input_data)
             else:
-                message = json.dumps(input_data, ensure_ascii=False)
-            
+                data = input_data
+
+            title = data.get("title", "")
+            description = data.get("content", "")
+
             self.log_info("正在生成首次搜索查询")
-            
+
+            # 使用CoT格式提示词
+            cot_prompt = SEARCH_QUERY_PROMPT.format(title=title, description=description)
+
             # 调用LLM
-            response = self.llm_client.invoke(SYSTEM_PROMPT_FIRST_SEARCH, message)
-            
+            response = self.llm_client.invoke("", cot_prompt)
+
             # 处理响应
             processed_response = self.process_output(response)
-            
+
             self.log_info(f"生成搜索查询: {processed_response.get('search_query', 'N/A')}")
             return processed_response
-            
+
         except Exception as e:
             self.log_error(f"生成首次搜索查询失败: {str(e)}")
             raise e
@@ -79,45 +86,72 @@ class FirstSearchNode(BaseNode):
     def process_output(self, output: str) -> Dict[str, str]:
         """
         处理LLM输出，提取搜索查询和推理
-        
-        Args:
-            output: LLM原始输出
-            
-        Returns:
-            包含search_query和reasoning的字典
+        优先解析CoT文本格式，回退到JSON解析
         """
         try:
+            reasoning_text = ""
+            search_query = ""
+
+            # 1. 优先尝试提取 CoT 格式（推理过程 + 搜索查询）
+            # 匹配“搜索查询：”后面的内容（支持中英文冒号，直到行尾）
+            query_match = re.search(r'搜索查询[：:]\s*(.+?)(?=\n|$)', output, re.IGNORECASE)
+            if query_match:
+                search_query = query_match.group(1).strip()
+                # 移除可能的引号
+                search_query = search_query.strip('"').strip("'")
+                self.log_info(f"CoT格式提取查询: {search_query}")
+
+            # 提取推理过程（可选，用于日志）
+            reasoning_match = re.search(r'推理过程[：:]\s*(.+?)(?=\n(?:搜索查询|缺失问题|\*\*|$))', output, re.DOTALL | re.IGNORECASE)
+            if reasoning_match:
+                reasoning_text = reasoning_match.group(1).strip()
+                self.log_info(f"[反思推理过程]\n{reasoning_text}")
+
+            # 2. 如果 CoT 格式提取到了查询，直接返回
+            if search_query:
+                return {
+                    "search_query": search_query,
+                    "reasoning": reasoning_text
+                }
+
+            # 3. 回退：原有 JSON 解析逻辑
+            # 提取推理过程（旧格式兼容）
+            if "推理过程：" in output or "推理分析：" in output:
+                reasoning_match = re.search(r'(推理过程[:：]|推理分析[:：])(.*?)(?=```json|\{)', output, re.DOTALL)
+                if reasoning_match:
+                    reasoning_text = reasoning_match.group(2).strip()
+                    self.log_info(f"[反思推理过程]\n{reasoning_text}")
+
             # 清理响应文本
             cleaned_output = remove_reasoning_from_output(output)
             cleaned_output = clean_json_tags(cleaned_output)
-            
-            # 解析JSON
+
             try:
                 result = json.loads(cleaned_output)
             except JSONDecodeError:
-                # 使用更强大的提取方法
                 result = extract_clean_response(cleaned_output)
                 if "error" in result:
                     raise ValueError("JSON解析失败")
-            
-            # 验证和清理结果
+
             search_query = result.get("search_query", "")
             reasoning = result.get("reasoning", "")
-            
+
+            if not reasoning and reasoning_text:
+                reasoning = reasoning_text[:500]
+
             if not search_query:
                 raise ValueError("未找到搜索查询")
-            
+
             return {
                 "search_query": search_query,
                 "reasoning": reasoning
             }
-            
+
         except Exception as e:
             self.log_error(f"处理输出失败: {str(e)}")
-            # 返回默认查询
             return {
-                "search_query": "相关主题研究",
-                "reasoning": "由于解析失败，使用默认搜索查询"
+             "search_query": "深度研究补充信息",
+                "reasoning": "由于解析失败，使用默认反思搜索查询"
             }
 
 
