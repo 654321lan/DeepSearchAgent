@@ -142,9 +142,14 @@ SYSTEM_PROMPT_REPORT_STRUCTURE = f"""
 {json.dumps(output_schema_report_structure, indent=2, ensure_ascii=False)}
 </OUTPUT JSON SCHEMA>
 
-标题和内容属性将用于更深入的研究。
-确保输出是一个符合上述输出JSON模式定义的JSON对象。
-只返回JSON对象，不要有解释或额外文本。
+示例输出（最外层必须是数组）：
+[
+  {{"title": "引言", "content": "介绍主题背景"}},
+  {{"title": "主要趋势", "content": "分析关键趋势"}}
+]
+
+确保输出是一个符合上述输出JSON模式定义的JSON数组。
+只返回JSON数组，不要有解释或额外文本。
 """
 
 # 每个段落第一次搜索的系统提示词

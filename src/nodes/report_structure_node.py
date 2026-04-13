@@ -65,47 +65,66 @@ class ReportStructureNode(StateMutationNode):
     def process_output(self, output: str) -> List[Dict[str, str]]:
         """
         处理LLM输出，提取报告结构
-        
-        Args:
-            output: LLM原始输出
-            
-        Returns:
-            处理后的报告结构列表
+        支持：JSON数组、逗号分隔的对象、包含sections键的对象
         """
         try:
             # 清理响应文本
             cleaned_output = remove_reasoning_from_output(output)
             cleaned_output = clean_json_tags(cleaned_output)
-            
-            # 解析JSON
+        
+            # 尝试直接解析
             try:
-                report_structure = json.loads(cleaned_output)
+                data = json.loads(cleaned_output)
             except JSONDecodeError:
-                # 使用更强大的提取方法
-                report_structure = extract_clean_response(cleaned_output)
-                if "error" in report_structure:
-                    raise ValueError("JSON解析失败")
-            
-            # 验证结构
-            if not isinstance(report_structure, list):
-                raise ValueError("报告结构应该是一个列表")
-            
+                # 尝试处理逗号分隔的对象（无外层数组）
+                # 例如: {...}, {...} -> 包装成 [...]
+                if cleaned_output.strip().startswith('{') and not cleaned_output.strip().startswith('['):
+                    import re
+                    # 匹配完整的JSON对象（简单模式，适用于对象内无嵌套对象的情况）
+                    objects = re.findall(r'\{[^{}]*\}', cleaned_output)
+                    if objects:
+                        items = []
+                        for obj_str in objects:
+                            try:
+                                items.append(json.loads(obj_str))
+                            except:
+                                pass
+                        if items:
+                            data = items
+                        else:
+                            raise ValueError("无法提取任何有效对象")
+                    else:
+                        raise
+                else:
+                    raise
+        
+            # 处理不同的数据结构
+            if isinstance(data, list):
+                sections = data
+            elif isinstance(data, dict) and "sections" in data:
+                sections = data["sections"]
+            elif isinstance(data, dict):
+                sections = [data]  # 单个对象包装成列表
+            else:
+                sections = []
+        
             # 验证每个段落
             validated_structure = []
-            for i, paragraph in enumerate(report_structure):
+            for i, paragraph in enumerate(sections):
                 if not isinstance(paragraph, dict):
                     continue
-                
                 title = paragraph.get("title", f"段落 {i+1}")
                 content = paragraph.get("content", "")
-                
                 validated_structure.append({
                     "title": title,
                     "content": content
                 })
-            
+        
+            if not validated_structure:
+                raise ValueError("未提取到有效段落")
+        
             return validated_structure
-            
+        
         except Exception as e:
             self.log_error(f"处理输出失败: {str(e)}")
             # 返回默认结构

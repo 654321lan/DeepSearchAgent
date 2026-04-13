@@ -6,6 +6,7 @@
 import os
 import json
 import re
+import httpx
 from typing import Optional, Dict, Any
 from openai import OpenAI
 from .base import BaseLLM
@@ -35,7 +36,8 @@ class ZhipuLLM(BaseLLM):
         # 初始化OpenAI客户端，使用智谱AI的endpoint（OpenAI兼容）
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.ZHIPU_API_BASE
+            base_url=self.ZHIPU_API_BASE,
+            http_client=httpx.Client(timeout=httpx.Timeout(90.0, connect=30.0))
         )
 
         self.default_model = model_name or self.get_default_model()

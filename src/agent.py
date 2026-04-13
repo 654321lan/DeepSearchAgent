@@ -463,6 +463,22 @@ class DeepSearchAgent:
         Returns:
             最终报告内容
         """
+         # 根据配置决定是否启用学术模式
+        if getattr(self.config, 'academic_mode', False):
+            print("✅ 健康溯源模式已启用，使用学术搜索")
+            from src.nodes.academic_node import AcademicNode
+            academic = AcademicNode(self.llm_client)
+            result = academic.run(query)
+            if save_report:
+                safe_query = "".join(c for c in query if c.isalnum() or c in " _-")[:30]
+                filename = f"{self.config.output_dir}/academic_{safe_query}.md"
+                os.makedirs(self.config.output_dir, exist_ok=True)
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(result)
+                print(f"学术报告已保存到: {filename}")
+            return result
+
+
         print(f"\n{'='*60}")
         print(f"开始深度研究: {query}")
         print(f"{'='*60}")

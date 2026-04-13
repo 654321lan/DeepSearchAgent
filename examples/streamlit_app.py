@@ -49,7 +49,7 @@ def main():
         "openai": "OpenAI"
     }
     PROVIDER_MODELS = {
-        "zhipu": ["glm-4", "glm-4-plus", "glm-4v","glm-4.5-air"],
+        "zhipu": ["glm-4.7", "glm-4.6v", "glm-4","glm-4.5-air"],
         "deepseek": ["deepseek-chat"],
         "openai": ["gpt-4o-mini", "gpt-4o"]
     }
@@ -149,6 +149,7 @@ def main():
                                        default_config.max_search_results if default_config else 3)
         max_content_length = st.number_input("最大内容长度", 1000, 50000,
                                              default_config.max_content_length if default_config else 20000)
+        academic_mode = st.checkbox("🔬 健康溯源模式（学术证据）", value=False)
 
     # 主界面
     col1, col2 = st.columns([2, 1])
@@ -208,6 +209,8 @@ def main():
             st.error("请提供 Tavily API Key")
             return
 
+        print(f"DEBUG: academic_mode checkbox = {academic_mode}")
+
         # 创建配置
         config = Config(
             deepseek_api_key=deepseek_key if llm_provider == "deepseek" else None,
@@ -217,11 +220,12 @@ def main():
             default_llm_provider=llm_provider,
             deepseek_model=model_name if llm_provider == "deepseek" else "deepseek-chat",
             openai_model=model_name if llm_provider == "openai" else "gpt-4o-mini",
-            zhipu_model=model_name if llm_provider == "zhipu" else "glm-4",
+            zhipu_model=model_name if llm_provider == "zhipu" else "glm-4.7",
             max_reflections=max_reflections,
             max_search_results=max_search_results,
             max_content_length=max_content_length,
-            output_dir="streamlit_reports"
+            output_dir="streamlit_reports",
+            academic_mode=academic_mode
         )
 
         # 执行研究
@@ -241,65 +245,13 @@ def update_status_display(placeholder, agent=None, message=None):
         else:
             st.info(message if message else "尚未开始研究")
 
-
 def execute_research(query: str, config: Config, status_placeholder):
-    """执行研究"""
+    """执行研究 - 直接调用 agent.research() 以支持学术模式等分支逻辑"""
     try:
-        # 创建进度条
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        # 初始化Agent
-        status_text.text("正在初始化Agent...")
-        update_status_display(status_placeholder, message="正在初始化Agent...")
         agent = DeepSearchAgent(config)
         st.session_state.agent = agent
-
-        progress_bar.progress(10)
-
-        # 生成报告结构
-        status_text.text("正在生成报告结构...")
-        update_status_display(status_placeholder, agent, "正在生成报告结构...")
-        agent._generate_report_structure(query)
-        progress_bar.progress(20)
-
-        # 处理段落
-        total_paragraphs = len(agent.state.paragraphs)
-        for i in range(total_paragraphs):
-            paragraph_title = agent.state.paragraphs[i].title
-            status_text.text(f"正在处理段落 {i+1}/{total_paragraphs}: {paragraph_title}")
-            update_status_display(status_placeholder, agent, f"处理段落 {i+1}/{total_paragraphs}")
-
-            # 初始搜索和总结
-            agent._initial_search_and_summary(i)
-            progress_value = 20 + (i + 0.5) / total_paragraphs * 60
-            progress_bar.progress(int(progress_value))
-
-            # 反思循环
-            agent._reflection_loop(i)
-            agent.state.paragraphs[i].research.mark_completed()
-
-            progress_value = 20 + (i + 1) / total_paragraphs * 60
-            progress_bar.progress(int(progress_value))
-
-        # 生成最终报告
-        status_text.text("正在生成最终报告...")
-        update_status_display(status_placeholder, agent, "正在生成最终报告...")
-        final_report = agent._generate_final_report()
-        progress_bar.progress(90)
-
-        # 保存报告
-        status_text.text("正在保存报告...")
-        update_status_display(status_placeholder, agent, "正在保存报告...")
-        agent._save_report(final_report)
-        progress_bar.progress(100)
-
-        status_text.text("研究完成！")
-        update_status_display(status_placeholder, agent, "✅ 研究完成！")
-
-        # 显示结果
+        final_report = agent.research(query, save_report=True)
         display_results(agent, final_report)
-
     except Exception as e:
         st.error(f"研究过程中发生错误: {str(e)}")
 
