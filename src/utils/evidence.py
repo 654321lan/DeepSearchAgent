@@ -8,9 +8,14 @@ def get_evidence_level(paper: dict) -> str:
     """
     根据论文信息判断证据等级
     """
-    title_abs = (paper.get('title', '') + ' ' + paper.get('abstract', '')).lower()
-    year = paper.get('year', 2024)
+    title = paper.get('title', '').lower()
+    abstract = paper.get('abstract', '').lower()
+    year = paper.get('year', 0)
+    if year is None:
+        year = 0
 
+    title_abs = title + " " + abstract
+    
     # 优先级匹配
     if re.search(r'systematic review|meta-analysis', title_abs):
         level = "⭐⭐⭐ 系统综述/Meta分析"
