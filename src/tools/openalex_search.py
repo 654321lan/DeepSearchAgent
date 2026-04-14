@@ -21,7 +21,8 @@ class OpenAlexSearch:
         params = {
             "search": query,
             "per-page": max_results,
-            "sort": "publication_date:desc",
+            #"sort": "relevance_score",
+            #"select": "title,publication_date,authorships,primary_location,abstract,doi"
         }
 
         max_retries = 2
@@ -91,6 +92,7 @@ class OpenAlexSearch:
                 "journal": journal,
                 "abstract": abstract[:600],
                 "doi": doi,
+                "relevance_score": item.get("relevance_score", 0)
             })
 
         return papers
