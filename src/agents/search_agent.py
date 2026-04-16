@@ -10,21 +10,37 @@ class SearchAgent(BaseAgent):
         self.crossref_search = crossref_search
         self.openalex_search = openalex_search
 
+    def _format_keywords(self, keywords: Any) -> str:
+        """格式化关键词为搜索查询字符串"""
+        if isinstance(keywords, list):
+            # 如果是列表，用空格连接前3个关键词
+            valid_keywords = [str(k) for k in keywords if k and str(k).strip()]
+            if not valid_keywords:
+                return "health"
+            # 只使用前3个关键词，避免查询过长
+            return " ".join(valid_keywords[:3])
+        elif isinstance(keywords, str):
+            return keywords.strip() if keywords.strip() else "health"
+        else:
+            return str(keywords) if keywords else "health"
+
     def process(self, input_data: dict) -> dict:
         keywords = input_data.get('keywords', '')
-        if not keywords:
+        formatted_query = self._format_keywords(keywords)
+
+        if not formatted_query:
             return {'papers': [], 'status': 'error', 'message': '关键词为空'}
 
         def search_crossref():
             try:
-                return self.crossref_search.search(keywords, max_results=8)
+                return self.crossref_search.search(formatted_query, max_results=8)
             except Exception as e:
                 print(f"Crossref 搜索失败: {e}")
                 return []
 
         def search_openalex():
             try:
-                return self.openalex_search.search(keywords, max_results=8)
+                return self.openalex_search.search(formatted_query, max_results=8)
             except Exception as e:
                 print(f"OpenAlex 搜索失败: {e}")
                 return []

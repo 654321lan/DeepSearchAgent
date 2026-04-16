@@ -149,6 +149,7 @@ class State:
     is_completed: bool = False                                     # 是否完成
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    academic_papers: List[Dict[str, Any]] = field(default_factory=list)  # 学术论文列表
     
     def add_paragraph(self, title: str, content: str) -> int:
         """
@@ -217,7 +218,8 @@ class State:
             "final_report": self.final_report,
             "is_completed": self.is_completed,
             "created_at": self.created_at,
-            "updated_at": self.updated_at
+            "updated_at": self.updated_at,
+            "academic_papers": self.academic_papers
         }
     
     def to_json(self, indent: int = 2) -> str:
@@ -228,7 +230,7 @@ class State:
     def from_dict(cls, data: Dict[str, Any]) -> "State":
         """从字典创建State对象"""
         paragraphs = [Paragraph.from_dict(p_data) for p_data in data.get("paragraphs", [])]
-        
+
         return cls(
             query=data.get("query", ""),
             report_title=data.get("report_title", ""),
@@ -236,7 +238,8 @@ class State:
             final_report=data.get("final_report", ""),
             is_completed=data.get("is_completed", False),
             created_at=data.get("created_at", datetime.now().isoformat()),
-            updated_at=data.get("updated_at", datetime.now().isoformat())
+            updated_at=data.get("updated_at", datetime.now().isoformat()),
+            academic_papers=data.get("academic_papers", [])
         )
     
     @classmethod

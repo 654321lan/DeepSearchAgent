@@ -7,8 +7,12 @@ import json
 import os
 import pickle
 import hashlib
+import logging
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
+
+# 配置日志记录
+logger = logging.getLogger(__name__)
 
 from .llms import DeepSeekLLM, OpenAILLM, ZhipuLLM, BaseLLM
 from .nodes import (
@@ -452,20 +456,24 @@ class DeepSearchAgent:
             print(f"内容验证失败: {str(e)}")
             return default_result
 
-    def research(self, query: str, save_report: bool = True) :
+    def research(self, query: str, save_report: bool = True, callback: Optional[Callable] = None) :
         """
         执行深度研究
 
         Args:
             query: 研究查询
             save_report: 是否保存报告到文件
+            callback: 进度回调函数，接收进度信息
 
         Returns:
             最终报告内容
         """
-         # 根据配置决定是否启用学术模式
+        logger.info(f"开始研究: {query}")
+
+        # 根据配置决定是否启用学术模式
         if getattr(self.config, 'academic_mode', False):
             print("✅ 健康溯源模式已启用，使用学术搜索")
+            logger.info("学术模式已启用")
             from src.nodes.academic_node import AcademicNode
             academic = AcademicNode(self.llm_client, self.config)
             final_report, papers = academic.run(query)   # 接收两个返回值
@@ -476,41 +484,61 @@ class DeepSearchAgent:
                 with open(filename, "w", encoding="utf-8") as f:
                     f.write(final_report)
                 print(f"学术报告已保存到: {filename}")
-            # 将论文列表存入 Streamlit session_state（如果可用）
-            try:
-                import streamlit as st
-                st.session_state.academic_papers = papers
-            except:
-                pass
-            return final_report, None
+                logger.info(f"学术报告已保存到: {filename}")
+            # 将论文列表存入状态，保证状态持久化
+            self.state.academic_papers = papers
+            logger.info(f"学术论文列表已保存到状态: {len(papers) if papers else 0} 篇")
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=0, message="学术模式研究完成", total_steps=1)
+            return final_report, papers
 
         print(f"\n{'='*60}")
         print(f"开始深度研究: {query}")
         print(f"{'='*60}")
+        # 调用回调（如果提供）
+        if callback:
+            callback(progress=0, message="开始深度研究", total_steps=4)
 
         # 检查缓存 - 优先从缓存获取结果，不调用任何API
         cached_result = self.get_cached_result(query)
         if cached_result is not None:
             print("⚡ 从缓存获取结果，无需重新搜索！")
+            logger.info("从缓存获取结果")
             if save_report:
                 # 缓存的结果是最终报告
                 self._save_report(cached_result)
                 print(f"报告已保存（来自缓存）")
-            return cached_result
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=100, message="从缓存获取结果完成", total_steps=4)
+            return cached_result, None
 
         try:
             # Step 1: 生成报告结构
             self._generate_report_structure(query)
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=25, message="生成报告结构完成", total_steps=4)
 
             # Step 2: 处理每个段落
             self._process_paragraphs()
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=75, message="处理所有段落完成", total_steps=4)
 
             # Step 3: 生成最终报告
             final_report = self._generate_final_report()
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=90, message="生成最终报告完成", total_steps=4)
 
             # Step 4: 保存报告
             if save_report:
                 self._save_report(final_report)
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=95, message="保存报告完成", total_steps=4)
 
             print(f"\n{'='*60}")
             print("深度研究完成！")
@@ -519,11 +547,19 @@ class DeepSearchAgent:
             # 保存结果到缓存
             self.cache_result(query, final_report)
             print(f"研究结果已缓存")
+            logger.info("深度研究完成，结果已缓存")
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=100, message="深度研究完成", total_steps=4)
 
-            return final_report
+            return final_report, None
 
         except Exception as e:
             print(f"研究过程中发生错误: {str(e)}")
+            logger.error(f"研究过程中发生错误: {str(e)}", exc_info=True)
+            # 调用回调（如果提供）
+            if callback:
+                callback(progress=-1, message=f"研究过程中发生错误: {str(e)}", total_steps=4)
             raise e
     
     def _generate_report_structure(self, query: str):

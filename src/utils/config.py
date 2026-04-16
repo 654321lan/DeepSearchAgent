@@ -41,28 +41,31 @@ class Config:
 
     def validate(self) -> bool:
         """验证配置"""
-        # 检查必需的API密钥（学术模式不需要 Tavily，但原流程需要）
-        if not self.academic_mode:
-            if self.default_llm_provider == "deepseek" and not self.deepseek_api_key:
-                print("错误: DeepSeek API Key未设置")
-                return False
-
-            if self.default_llm_provider == "openai" and not self.openai_api_key:
-                print("错误: OpenAI API Key未设置")
-                return False
-
-            if self.default_llm_provider == "zhipu" and not self.zhipu_api_key:
-                print("错误: 智谱AI API Key未设置")
-                return False
-
-            if not self.tavily_api_key:
-                print("错误: Tavily API Key未设置")
-                return False
-        else:
-            # 学术模式只需要智谱 API Key
+        # 学术模式下，强制将default_llm_provider设为zhipu，仅校验zhipu_api_key
+        if self.academic_mode:
+            self.default_llm_provider = "zhipu"  # 强制设置为智谱AI
             if not self.zhipu_api_key:
                 print("错误: 学术模式需要智谱AI API Key")
                 return False
+            # 学术模式下不需要Tavily API Key
+            return True
+
+        # 非学术模式，校验对应LLM提供商的API Key + Tavily API Key
+        if self.default_llm_provider == "deepseek" and not self.deepseek_api_key:
+            print("错误: DeepSeek API Key未设置")
+            return False
+
+        if self.default_llm_provider == "openai" and not self.openai_api_key:
+            print("错误: OpenAI API Key未设置")
+            return False
+
+        if self.default_llm_provider == "zhipu" and not self.zhipu_api_key:
+            print("错误: 智谱AI API Key未设置")
+            return False
+
+        if not self.tavily_api_key:
+            print("错误: Tavily API Key未设置")
+            return False
 
         return True
 
