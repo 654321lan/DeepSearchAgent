@@ -250,7 +250,8 @@ def execute_research(query: str, config: Config, status_placeholder):
     try:
         agent = DeepSearchAgent(config)
         st.session_state.agent = agent
-        final_report = agent.research(query, save_report=True)
+        final_report, papers = agent.research(query, save_report=True)
+        st.session_state.academic_papers = papers
         display_results(agent, final_report)
     except Exception as e:
         st.error(f"研究过程中发生错误: {str(e)}")
@@ -267,32 +268,55 @@ def display_results(agent: DeepSearchAgent, final_report: str):
         st.markdown(final_report)
 
     with tab2:
-        # 段落详情
-        st.subheader("段落详情")
-        for i, paragraph in enumerate(agent.state.paragraphs):
-            with st.expander(f"段落 {i+1}: {paragraph.title}"):
-                st.write("**预期内容:**", paragraph.content)
-                st.write("**最终内容:**", paragraph.research.latest_summary[:300] + "..."
-                        if len(paragraph.research.latest_summary) > 300
-                        else paragraph.research.latest_summary)
-                st.write("**搜索次数:**", paragraph.research.get_search_count())
-                st.write("**反思次数:**", paragraph.research.reflection_iteration)
-
-        # 搜索历史
-        st.subheader("搜索历史")
-        all_searches = []
-        for paragraph in agent.state.paragraphs:
-            all_searches.extend(paragraph.research.search_history)
-
-        if all_searches:
-            for i, search in enumerate(all_searches):
-                with st.expander(f"搜索 {i+1}: {search.query}"):
-                    st.write("**URL:**", search.url)
-                    st.write("**标题:**", search.title)
-                    st.write("**内容预览:**", search.content[:200] + "..." if len(search.content) > 200 else search.content)
-                    if search.score:
-                        st.write("**相关度评分:**", search.score)
-
+        if 'academic_papers' in st.session_state and st.session_state.academic_papers:
+            # 学术模式：展示论文详情
+            st.subheader("学术论文详情")
+            for i, paper in enumerate(st.session_state.academic_papers):
+                with st.expander(f"论文 {i+1}: {paper.get('title', '无标题')[:80]}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("**标题:**", paper.get('title', '无标题'))
+                        st.write("**作者:**", paper.get('authors', '无作者'))
+                        st.write("**年份:**", paper.get('year', '未知'))
+                    with col2:
+                        st.write("**期刊:**", paper.get('journal', '无期刊'))
+                        st.write("**DOI:**", paper.get('doi', '无DOI'))
+                        if paper.get('doi'):
+                            st.write("**URL:**", f"https://doi.org/{paper['doi']}")
+                    st.write("**证据等级:**", paper.get('evidence_level', '未评估'))
+                    st.write("**摘要预览:**", paper.get('abstract', '无摘要')[:300] + "...")
+            # 可选：显示论文总数
+            st.caption(f"共找到 {len(st.session_state.academic_papers)} 篇相关学术论文")
+            del st.session_state.academic_papers
+        else:
+            # 普通模式：展示段落详情 + 搜索历史
+            st.subheader("段落详情")
+            for i, paragraph in enumerate(agent.state.paragraphs):
+                with st.expander(f"段落 {i+1}: {paragraph.title}"):
+                    st.write("**预期内容:**", paragraph.content)
+                    final_summary = paragraph.research.latest_summary
+                    if len(final_summary) > 300:
+                        final_summary = final_summary[:300] + "..."
+                    st.write("**最终内容:**", final_summary)
+                    st.write("**搜索次数:**", paragraph.research.get_search_count())
+                    st.write("**反思次数:**", paragraph.research.reflection_iteration)
+        
+            # 搜索历史
+            st.subheader("搜索历史")
+            all_searches = []
+            for paragraph in agent.state.paragraphs:
+                all_searches.extend(paragraph.research.search_history)
+            if all_searches:
+                for i, search in enumerate(all_searches):
+                    with st.expander(f"搜索 {i+1}: {search.query}"):
+                        st.write("**URL:**", search.url)
+                        st.write("**标题:**", search.title)
+                        st.write("**内容预览:**", search.content[:200] + "..." if len(search.content) > 200 else search.content)
+                        if search.score:
+                            st.write("**相关度评分:**", search.score)
+            else:
+                st.info("暂无搜索历史")
+        
     with tab3:
         # 下载选项
         st.subheader("下载报告")
@@ -312,7 +336,7 @@ def display_results(agent: DeepSearchAgent, final_report: str):
             data=state_json,
             file_name=f"deep_search_state_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json"
-        )
+            )
 
 
 if __name__ == "__main__":

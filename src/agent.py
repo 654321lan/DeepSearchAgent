@@ -452,7 +452,7 @@ class DeepSearchAgent:
             print(f"内容验证失败: {str(e)}")
             return default_result
 
-    def research(self, query: str, save_report: bool = True) -> str:
+    def research(self, query: str, save_report: bool = True) :
         """
         执行深度研究
 
@@ -467,17 +467,22 @@ class DeepSearchAgent:
         if getattr(self.config, 'academic_mode', False):
             print("✅ 健康溯源模式已启用，使用学术搜索")
             from src.nodes.academic_node import AcademicNode
-            academic = AcademicNode(self.llm_client)
-            result = academic.run(query)
+            academic = AcademicNode(self.llm_client, self.config)
+            final_report, papers = academic.run(query)   # 接收两个返回值
             if save_report:
                 safe_query = "".join(c for c in query if c.isalnum() or c in " _-")[:30]
                 filename = f"{self.config.output_dir}/academic_{safe_query}.md"
                 os.makedirs(self.config.output_dir, exist_ok=True)
                 with open(filename, "w", encoding="utf-8") as f:
-                    f.write(result)
+                    f.write(final_report)
                 print(f"学术报告已保存到: {filename}")
-            return result
-
+            # 将论文列表存入 Streamlit session_state（如果可用）
+            try:
+                import streamlit as st
+                st.session_state.academic_papers = papers
+            except:
+                pass
+            return final_report, None
 
         print(f"\n{'='*60}")
         print(f"开始深度研究: {query}")

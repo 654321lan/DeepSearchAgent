@@ -50,14 +50,13 @@ class OpenAlexSearch:
                 time.sleep(1)
 
         papers = []
-        for item in data.get("results", []):
+        for idx, item in enumerate(data.get("results", [])):
             # 提取年份
             pub_date = item.get("publication_date", "")
             year = 0
             if pub_date and len(pub_date) >= 4 and pub_date[:4].isdigit():
                 year = int(pub_date[:4])
-
-            # 提取作者（最多显示3个）
+            # 提取作者
             authors = []
             for auth in item.get("authorships", []):
                 author = auth.get("author", {})
@@ -67,7 +66,6 @@ class OpenAlexSearch:
             author_str = ", ".join(authors[:3])
             if len(authors) > 3:
                 author_str += " et al."
-
             # 提取期刊名
             primary_location = item.get("primary_location")
             if primary_location:
@@ -75,16 +73,13 @@ class OpenAlexSearch:
                 journal = source.get("display_name", "无期刊") if source else "无期刊"
             else:
                 journal = "无期刊"
-
-            # 摘要
             abstract = item.get("abstract", "")
             if not abstract:
                 abstract = "无摘要"
-
-            # DOI
             doi_raw = item.get("doi")
             doi = doi_raw.replace("https://doi.org/", "") if doi_raw else ""
-
+            # 计算相关性分数（基于位置）
+            relevance_score = max(0.1, 1.0 - idx * 0.1)
             papers.append({
                 "title": item.get("title", "无标题"),
                 "authors": author_str or "无作者",
@@ -92,7 +87,7 @@ class OpenAlexSearch:
                 "journal": journal,
                 "abstract": abstract[:600],
                 "doi": doi,
-                "relevance_score": item.get("relevance_score", 0)
+                "relevance_score": relevance_score,
+                "source": "openalex"
             })
-
         return papers
