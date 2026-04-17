@@ -9,7 +9,9 @@ import logging
 import streamlit as st
 from datetime import datetime
 import json
-from typing import Dict, Any
+import hashlib
+import pickle
+from typing import Dict, Any, Optional
 from enum import Enum
 
 # 配置日志记录
@@ -37,6 +39,121 @@ class NodeStatus(Enum):
     ERROR = "error"
 
 
+class LocalFileCache:
+    """本地文件缓存 - 用于学术模式节点缓存"""
+
+    def __init__(self, cache_dir: str = "streamlit_reports"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def _generate_cache_key(self, query: str, node_id: int) -> str:
+        """生成缓存键：使用query哈希+节点ID"""
+        if query is None:
+            query = ""
+        query_hash = hashlib.sha256(query.encode('utf-8')).hexdigest()[:16]
+        return f"node_{node_id}_{query_hash}"
+
+    def _get_cache_file_path(self, cache_key: str) -> str:
+        """获取缓存文件路径"""
+        return os.path.join(self.cache_dir, f"{cache_key}.pkl")
+
+    def get(self, query: str, node_id: int) -> Optional[Dict[str, Any]]:
+        """从缓存读取数据"""
+        try:
+            cache_key = self._generate_cache_key(query, node_id)
+            cache_file = self._get_cache_file_path(cache_key)
+
+            if os.path.exists(cache_file):
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    # 检查缓存是否有效（24小时）
+                    from datetime import datetime, timedelta
+                    cache_time = datetime.fromisoformat(cached_data.get('timestamp', '1970-01-01T00:00:00'))
+                    if datetime.now() - cache_time < timedelta(hours=24):
+                        logger.info(f"✅ 缓存命中: 节点{node_id}, query={query[:30]}...")
+                        return cached_data.get('data')
+                    else:
+                        logger.info(f"⏰ 缓存已过期: 节点{node_id}")
+            return None
+        except Exception as e:
+            logger.error(f"读取缓存失败: {e}")
+            return None
+
+    def set(self, query: str, node_id: int, data: Dict[str, Any]):
+        """保存数据到缓存"""
+        try:
+            cache_key = self._generate_cache_key(query, node_id)
+            cache_file = self._get_cache_file_path(cache_key)
+
+            cached_data = {
+                'data': data,
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'node_id': node_id
+            }
+
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cached_data, f)
+
+            logger.info(f"💾 缓存已保存: 节点{node_id}, query={query[:30]}...")
+        except Exception as e:
+            logger.error(f"保存缓存失败: {e}")
+
+    def clear(self, query: str = None, node_id: int = None):
+        """清空缓存"""
+        try:
+            if query is None and node_id is None:
+                # 清空所有缓存
+                for filename in os.listdir(self.cache_dir):
+                    if filename.endswith('.pkl'):
+                        os.remove(os.path.join(self.cache_dir, filename))
+                logger.info("🗑️ 已清空所有缓存")
+            else:
+                # 清空指定缓存
+                cache_key = self._generate_cache_key(query, node_id)
+                cache_file = self._get_cache_file_path(cache_key)
+                if os.path.exists(cache_file):
+                    os.remove(cache_file)
+                    logger.info(f"🗑️ 已清空缓存: 节点{node_id}")
+        except Exception as e:
+            logger.error(f"清空缓存失败: {e}")
+
+    def list_cache_info(self) -> Dict[str, Any]:
+        """列出缓存信息"""
+        try:
+            cache_files = [f for f in os.listdir(self.cache_dir) if f.endswith('.pkl')]
+            cache_info = []
+            from datetime import datetime, timedelta
+            now = datetime.now()
+
+            for filename in cache_files:
+                filepath = os.path.join(self.cache_dir, filename)
+                try:
+                    with open(filepath, 'rb') as f:
+                        cached_data = pickle.load(f)
+                        cache_time = datetime.fromisoformat(cached_data.get('timestamp', '1970-01-01T00:00:00'))
+                        is_valid = now - cache_time < timedelta(hours=24)
+
+                        cache_info.append({
+                            'filename': filename,
+                            'node_id': cached_data.get('node_id'),
+                            'query': cached_data.get('query', '')[:50],
+                            'timestamp': cached_data.get('timestamp'),
+                            'is_valid': is_valid
+                        })
+                except:
+                    pass
+
+            return {
+                'total_files': len(cache_files),
+                'cache_dir': self.cache_dir,
+                'caches': cache_info
+            }
+        except Exception as e:
+            logger.error(f"列出缓存信息失败: {e}")
+            return {'total_files': 0, 'cache_dir': self.cache_dir, 'caches': []}
+
+
 class StreamlitUIOrchestrator:
     """Streamlit UI编排器 - 负责分步执行流程管理"""
 
@@ -61,7 +178,8 @@ class StreamlitUIOrchestrator:
         self.node_status = {node["id"]: NodeStatus.PENDING for node in self.NODES}
         self.node_results = {}
         self.node_errors = {}
-        self.auto_execute = True  # 默认自动执行
+        self.auto_execute = False  # 修改为默认不自动执行，保持手动点击
+        self.cache = LocalFileCache()  # 本地文件缓存
 
         # 初始化会话状态
         self._init_session_state()
@@ -152,9 +270,18 @@ class StreamlitUIOrchestrator:
             else:
                 raise ValueError(f"未知的节点ID: {node_id}")
 
-            self.node_status[node_id] = NodeStatus.COMPLETED
-            self.current_node = max(self.current_node, node_id)
-            self._save_state()
+            # 只在节点结果存在时才标记为完成
+            if node_id in self.node_results and self.node_results[node_id]:
+                self.node_status[node_id] = NodeStatus.COMPLETED
+                self.current_node = max(self.current_node, node_id)
+                self._save_state()
+            else:
+                # 如果没有结果，标记为错误
+                self.node_status[node_id] = NodeStatus.ERROR
+                self.node_errors[node_id] = "节点执行失败，未生成结果"
+                self._save_state()
+                return False
+
             return True
 
         except Exception as e:
@@ -162,7 +289,7 @@ class StreamlitUIOrchestrator:
             self.node_status[node_id] = NodeStatus.ERROR
             self.node_errors[node_id] = str(e)
             self._save_state()
-            st.rerun()
+            # 移除 st.rerun() 调用，让调用者决定是否重新运行
             return False
 
     def execute_all(self):
@@ -175,6 +302,15 @@ class StreamlitUIOrchestrator:
 
         if self.mode == "academic":
             # 学术模式：使用QueryAnalyzerAgent进行查询分析
+
+            # 1. 先读取缓存
+            cached_data = self.cache.get(self.query, 1)
+            if cached_data is not None:
+                logger.info("✅ 节点1从缓存读取成功")
+                self.node_results[1] = cached_data
+                return
+
+            # 2. 缓存未命中，执行查询分析
             from src.agents.coordinator import AcademicCoordinator
             from src.tools.crossref_search import CrossrefSearch
             from src.tools.openalex_search import OpenAlexSearch
@@ -187,16 +323,23 @@ class StreamlitUIOrchestrator:
 
             analysis_result = coordinator.query_analyzer.process({"query": self.query})
 
-            self.node_results[1] = {
+            result = {
                 "type": "academic",
                 "keywords": analysis_result.get("keywords", []),
                 "raw_response": analysis_result
             }
+
+            # 3. 保存结果到缓存
+            self.cache.set(self.query, 1, result)
+            self.node_results[1] = result
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
+
         else:
             # 通用模式：使用原有逻辑
             self.agent._generate_report_structure(self.query)
 
-            self.node_results[1] = {
+            result = {
                 "type": "general",
                 "paragraphs": [
                     {"title": p.title, "content": p.content}
@@ -204,12 +347,25 @@ class StreamlitUIOrchestrator:
                 ]
             }
 
+            # 通用模式也缓存
+            self.cache.set(self.query, 1, result)
+            self.node_results[1] = result
+
     def _execute_node2_search(self):
         """节点2：多源并发检索"""
         logger.info("执行节点2：多源并发检索")
 
         if self.mode == "academic":
             # 学术模式：使用SearchAgent进行搜索
+
+            # 1. 先读取缓存
+            cached_data = self.cache.get(self.query, 2)
+            if cached_data is not None:
+                logger.info("✅ 节点2从缓存读取成功")
+                self.node_results[2] = cached_data
+                return
+
+            # 2. 缓存未命中，执行搜索
             from src.agents.coordinator import AcademicCoordinator
             from src.tools.crossref_search import CrossrefSearch
             from src.tools.openalex_search import OpenAlexSearch
@@ -222,12 +378,30 @@ class StreamlitUIOrchestrator:
 
             keywords = self.node_results[1].get("keywords", [])
             search_result = coordinator.search_agent.process({"keywords": keywords})
+            papers = search_result.get("papers", [])
 
-            self.node_results[2] = {
+            for paper in papers:
+                # 优先从journal提取，无则取publisher/venue/container-title（兼容不同数据源）
+                paper["journal"] = paper.get("journal") or paper.get("publisher") or paper.get("venue") or paper.get("container-title") or "未公开来源"
+                # 年份兜底
+                paper["year"] = paper.get("year") or paper.get("publication_year") or 0
+                # DOI兜底
+                paper["doi"] = paper.get("doi") or ""
+                # 作者兜底
+                paper["authors"] = paper.get("authors") or "未知作者"
+
+            result = {
                 "type": "academic",
                 "papers": search_result.get("papers", []),
                 "raw_response": search_result
             }
+
+            # 3. 保存结果到缓存
+            self.cache.set(self.query, 2, result)
+            self.node_results[2] = result
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
+
         else:
             # 通用模式：处理所有段落的搜索
             self.agent._process_paragraphs()
@@ -246,7 +420,7 @@ class StreamlitUIOrchestrator:
                     for s in paragraph.research.search_history
                 ])
 
-            self.node_results[2] = {
+            result = {
                 "type": "general",
                 "searches": all_searches,
                 "paragraphs": [
@@ -258,6 +432,12 @@ class StreamlitUIOrchestrator:
                     for p in self.agent.state.paragraphs
                 ]
             }
+
+            # 通用模式也缓存
+            self.cache.set(self.query, 2, result)
+            self.node_results[2] = result
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
 
     def _execute_node3_deduplicate(self):
         """节点3：数据去重与融合"""
@@ -296,17 +476,28 @@ class StreamlitUIOrchestrator:
         logger.info("执行节点4：证据等级标注")
 
         if self.mode == "academic":
+            # 1. 先读取缓存
+            cached_data = self.cache.get(self.query, 4)
+            if cached_data is not None:
+                logger.info("✅ 节点4从缓存读取成功")
+                self.node_results[4] = cached_data
+                return
+
+            # 2. 缓存未命中，执行证据等级标注
             from src.utils.evidence import get_evidence_level, get_evidence_priority
 
             papers = self.node_results[3].get("papers", [])
 
             for paper in papers:
-                paper['evidence_level'] = get_evidence_level(paper)
-                paper['evidence_priority'] = get_evidence_priority(paper)
+                level_obj, details = get_evidence_level(paper)
+                paper['evidence_level'] = str(level_obj)
+                paper['grade_details'] = details
+                # 修复：传入枚举对象而非字符串
+                paper['evidence_priority'] = get_evidence_priority(level_obj)
                 if 'year' not in paper or not paper['year']:
                     paper['year'] = 0
 
-            self.node_results[4] = {
+            result = {
                 "type": "academic",
                 "papers": papers,
                 "stats": {
@@ -318,15 +509,26 @@ class StreamlitUIOrchestrator:
             # 统计各等级数量
             for paper in papers:
                 level = paper.get('evidence_level', '未知')
-                self.node_results[4]["stats"]["by_level"][level] = \
-                    self.node_results[4]["stats"]["by_level"].get(level, 0) + 1
+                result["stats"]["by_level"][level] = result["stats"]["by_level"].get(level, 0) + 1
+
+            # 3. 保存结果到缓存
+            self.cache.set(self.query, 4, result)
+            self.node_results[4] = result
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
 
         else:
             # 通用模式：不需要证据等级标注
-            self.node_results[4] = {
+            result = {
                 "type": "general",
                 "message": "通用模式不需要证据等级标注"
             }
+
+            # 通用模式也缓存
+            self.cache.set(self.query, 4, result)
+            self.node_results[4] = result
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
 
     def _execute_node5_filter(self):
         """节点5：文献筛选与排序"""
@@ -347,6 +549,8 @@ class StreamlitUIOrchestrator:
                 "papers": sorted_papers,
                 "top_10": sorted_papers[:10]
             }
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
         else:
             # 通用模式：按照段落的完成度排序
             completed_paragraphs = [
@@ -362,15 +566,28 @@ class StreamlitUIOrchestrator:
                 "type": "general",
                 "paragraphs": completed_paragraphs
             }
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
 
     def _execute_node6_conclude(self):
         """节点6：结论提取与生成"""
         logger.info("执行节点6：结论提取与生成")
 
         if self.mode == "academic":
+            # 1. 先读取本地缓存
+            cached_data = self.cache.get(self.query, 6)
+            if cached_data is not None:
+                logger.info("✅ 节点6从缓存读取成功")
+                self.node_results[6] = cached_data
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+                return
+
+            # 2. 缓存未命中，执行结论提取与生成
             from src.agents.coordinator import AcademicCoordinator
             from src.tools.crossref_search import CrossrefSearch
             from src.tools.openalex_search import OpenAlexSearch
+            import time
 
             coordinator = AcademicCoordinator(
                 self.agent.llm_client,
@@ -380,31 +597,156 @@ class StreamlitUIOrchestrator:
 
             papers = self.node_results[5].get("papers", [])
 
-            # 证据分析
-            evidence_result = coordinator.evidence_agent.process({"papers": papers})
+            # 为了避免429错误，在调用前添加延迟
+            logger.info("⏳ 调用结论提取前等待3秒，避免限流")
+            time.sleep(3)
 
-            if evidence_result['status'] != 'success':
-                raise Exception("证据分析失败")
+            # 结论提取与生成 - 添加429错误处理
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # 提取关键发现和结论
+                    key_findings_result = coordinator.summary_agent._extract_key_findings(papers)
+                    
+                    # 生成结构化结论
+                    conclusion_prompt = f"""
+基于以下文献证据，生成专业、详细、结构化的循证医学结论：
 
-            self.node_results[6] = {
-                "type": "academic",
-                "evidence_analysis": evidence_result,
-                "papers": evidence_result.get("papers", papers)
-            }
+查询问题：{self.query}
+
+相关文献：
+"""
+                    
+                    for i, paper in enumerate(papers[:10]):  # 最多处理前10篇高质量文献
+                        title = paper.get('title', '')
+                        year = paper.get('year', '')
+                        evidence_level = paper.get('evidence_level', '')
+                        key_finding = paper.get('key_finding', '')
+                        journal = paper.get('journal', '')
+                        
+                        conclusion_prompt += f"""
+{i+1}. 标题：{title}
+    年份：{year} | 期刊：{journal} | 证据等级：{evidence_level}
+    关键发现：{key_finding}
+"""
+
+                    conclusion_prompt += """
+
+请生成以下结构化内容：
+
+## 核心结论
+基于上述高质量文献证据，总结主要发现和核心观点。
+
+## 具体循证建议
+提供基于证据的具体临床实践建议，包括诊断、治疗、预防等方面。
+
+## 证据来源
+列出主要证据来源及其质量等级。
+"""
+
+                    # 调用LLM生成专业结论
+                    conclusion_result = coordinator.summary_agent._call_llm(
+                        conclusion_prompt,
+                        "你是循证医学专家，请基于文献证据生成专业、详细、结构化的医学结论。"
+                    )
+
+                    # 为每篇论文添加关键发现
+                    for paper in papers:
+                        if not paper.get('key_finding'):
+                            # 从标题和摘要中提取简化的关键发现
+                            title = paper.get('title', '')
+                            abstract = paper.get('abstract', '')
+                            if title and abstract:
+                                text_snippet = f"{title} {abstract[:100]}"
+                                paper['key_finding'] = text_snippet[:80] + "..." if len(text_snippet) > 80 else text_snippet
+                            else:
+                                paper['key_finding'] = "基于文献证据"
+
+                    result = {
+                        "type": "academic",
+                        "conclusion": conclusion_result,
+                        "papers": papers,
+                        "key_findings": key_findings_result
+                    }
+
+                    # 3. 保存结果到缓存
+                    self.cache.set(self.query, 6, result)
+                    self.node_results[6] = result
+
+                    # 保存状态，确保后续节点能正确加载
+                    self._save_state()
+
+                    logger.info("✅ 节点6执行成功")
+                    return
+
+                except Exception as e:
+                    error_msg = str(e)
+                    # 检查是否为429限流错误
+                    if "429" in error_msg or "速率限制" in error_msg or "rate limit" in error_msg.lower():
+                        wait_time = 15 * (attempt + 1)  # 15秒、30秒、45秒
+                        logger.warning(f"⚠️ 检测到429限流错误，等待{wait_time}秒后重试... (尝试 {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+
+                        if attempt == max_retries - 1:
+                            # 最后一次重试仍然失败，使用基础结论
+                            logger.warning("⚠️ 达到最大重试次数，使用基础结论生成")
+                            base_conclusion = f"""
+## 核心结论
+基于检索到的{len(papers)}篇相关文献，建议进一步分析具体文献内容。
+
+## 具体循证建议
+请结合临床实际情况和具体文献证据制定个体化治疗方案。
+
+## 证据来源
+详见上方文献表格中的具体论文信息。
+"""
+                            for paper in papers:
+                                if not paper.get('key_finding'):
+                                    paper['key_finding'] = "基于文献证据"
+                            
+                            result = {
+                                "type": "academic",
+                                "conclusion": base_conclusion,
+                                "papers": papers,
+                                "key_findings": papers
+                            }
+                            
+                            self.cache.set(self.query, 6, result)
+                            self.node_results[6] = result
+                            self._save_state()
+                            return
+                    else:
+                        # 非限流错误，直接抛出
+                        raise
         else:
             # 通用模式：生成最终报告
             final_report = self.agent._generate_final_report()
 
-            self.node_results[6] = {
+            result = {
                 "type": "general",
                 "report": final_report
             }
+
+            # 通用模式也缓存
+            self.cache.set(self.query, 6, result)
+            self.node_results[6] = result
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
 
     def _execute_node7_report(self):
         """节点7：报告生成与导出"""
         logger.info("执行节点7：报告生成与导出")
 
         if self.mode == "academic":
+            # 1. 先读取本地缓存
+            cached_data = self.cache.get(self.query, 7)
+            if cached_data is not None:
+                logger.info("✅ 节点7从缓存读取成功")
+                self.node_results[7] = cached_data
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+                return
+
             from src.agents.coordinator import AcademicCoordinator
             from src.tools.crossref_search import CrossrefSearch
             from src.tools.openalex_search import OpenAlexSearch
@@ -417,26 +759,55 @@ class StreamlitUIOrchestrator:
 
             papers = self.node_results[6].get("papers", [])
 
-            # 生成总结
-            summary_result = coordinator.summary_agent.process({
-                "query": self.query,
-                "papers": papers
-            })
+            # 生成总结（添加错误处理）
+            try:
+                summary_result = coordinator.summary_agent.process({
+                    "query": self.query,
+                    "papers": papers
+                })
 
-            if summary_result['status'] != 'success':
-                raise Exception("总结生成失败")
+                if summary_result['status'] != 'success':
+                    raise Exception("总结生成失败")
 
-            final_report = summary_result['summary']
+                final_report = summary_result['summary']
+            except Exception as e:
+                logger.error(f"总结生成失败，生成基础报告: {str(e)}")
+                # 生成一个基础的报告作为降级方案
+                table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
+                for p in papers:
+                    title_short = p['title'][:50] + ('...' if len(p['title']) > 50 else '')
+                    year = p['year']
+                    level = p['evidence_level']
+                    finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
+                    table += f"| {title_short} | {year} | {level} | {finding} |\n"
+                
+                # 基础总结
+                base_summary = f"""## 核心结论
+由于API调用限制，无法生成详细总结。建议基于上方文献表格自行分析。
+
+## 具体循证建议
+请结合临床实际情况制定个体化治疗方案。
+
+## 证据来源
+详见上方文献表格。"""
+                
+                final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{base_summary}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
 
             # 保存到状态
             self.agent.state.academic_papers = papers
             self.agent.state.final_report = final_report
 
-            self.node_results[7] = {
+            result = {
                 "type": "academic",
                 "report": final_report,
                 "papers": papers
             }
+
+            # 保存结果到本地缓存
+            self.cache.set(self.query, 7, result)
+            self.node_results[7] = result
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
         else:
             # 通用模式：报告已在节点6生成，这里保存
             report = self.node_results[6].get("report", "")
@@ -446,6 +817,8 @@ class StreamlitUIOrchestrator:
                 "report": report,
                 "papers": []
             }
+            # 保存状态，确保后续节点能正确加载
+            self._save_state()
 
     def rerun_from_node(self, node_id: int):
         """从指定节点重新执行（清除后续节点结果）"""
@@ -708,6 +1081,26 @@ def main():
                         # 未完成或出错的节点，点击执行
                         st.session_state.node_to_execute = node_id
 
+            # 缓存管理
+            with st.expander("🗄️ 缓存管理"):
+                col_cache1, col_cache2 = st.columns(2)
+
+                with col_cache1:
+                    if st.button("📊 查看本地缓存状态", use_container_width=True):
+                        st.session_state.show_cache_info = True
+
+                    if st.button("🗑️ 清空本地缓存", use_container_width=True):
+                        orchestrator.cache.clear()
+                        st.success("本地缓存已清空")
+                        st.rerun()
+
+                with col_cache2:
+                    if st.button("📋 列出缓存文件", use_container_width=True):
+                        st.session_state.show_cached_queries = True
+
+                    if st.button("⚙️ 缓存配置", use_container_width=True):
+                        st.session_state.show_cache_config = True
+
             # 重置按钮
             if st.button("🔄 重置流程", use_container_width=True):
                 orchestrator.reset()
@@ -871,6 +1264,40 @@ def main():
                 else:
                     st.info(f"节点{node_id}尚未执行")
 
+        # 显示缓存信息
+        if st.session_state.get("show_cache_info", False):
+            st.divider()
+            st.subheader("本地缓存状态")
+
+            cache_info = orchestrator.cache.list_cache_info()
+            st.json(cache_info)
+
+            if st.button("关闭缓存信息"):
+                st.session_state.show_cache_info = False
+                st.rerun()
+
+        # 显示缓存的查询列表
+        if st.session_state.get("show_cached_queries", False):
+            st.divider()
+            st.subheader("本地缓存文件")
+
+            cache_info = orchestrator.cache.list_cache_info()
+            caches = cache_info.get('caches', [])
+
+            if caches:
+                for cache in caches:
+                    with st.expander(f"节点{cache['node_id']}: {cache['query']} ({'有效' if cache['is_valid'] else '已过期'})"):
+                        st.write(f"文件名: {cache['filename']}")
+                        st.write(f"时间戳: {cache['timestamp']}")
+                        st.write(f"查询: {cache['query']}")
+                        st.write(f"状态: {'✅ 有效' if cache['is_valid'] else '❌ 已过期'}")
+            else:
+                st.info("暂无缓存文件")
+
+            if st.button("关闭缓存列表"):
+                st.session_state.show_cached_queries = False
+                st.rerun()
+
         # 显示完整报告
         if st.session_state.orchestrator is not None and st.session_state.get("show_full_report", False):
             orchestrator = st.session_state.orchestrator
@@ -891,21 +1318,25 @@ def main():
                 if orchestrator.mode == "academic" and papers:
                     st.subheader("学术论文详情")
                     for i, paper in enumerate(papers):
-                        with st.expander(f"论文 {i+1}: {paper.get('title', '无标题')[:80]}"):
+                        cite_idx = paper.get('cite_index', i+1)
+                        title = paper.get('title', '') or '无标题'
+                        title_display = title[:80] + ('...' if len(title) > 80 else '')
+                        with st.expander(f"论文 {i+1}: {title_display}"):
                             col1, col2 = st.columns(2)
                             with col1:
-                                st.write("**标题:**", paper.get('title', '无标题'))
+                                st.write("**标题:**", title)
                                 st.write("**作者:**", paper.get('authors', '无作者'))
-                                year = paper.get('year', 0)
+                                year = paper.get('year', 0) or 0
                                 st.write("**年份:**", str(year) if year > 0 else "未知年份")
                             with col2:
-                                journal = paper.get('journal', '')
+                                journal = paper.get('journal', '') or ''
                                 st.write("**期刊:**", journal if journal else "未指定期刊")
-                                doi = paper.get('doi', '')
+                                doi = paper.get('doi', '') or ''
                                 st.write("**DOI:**", doi if doi else "无DOI")
                                 if doi:
                                     st.write("**URL:**", f"https://doi.org/{doi}")
-                            st.write("**证据等级:**", paper.get('evidence_level', '未评估'))
+
+                            # 删除GRADE分级详情、核心证据片段、证据等级显示
                     st.caption(f"共找到 {len(papers)} 篇相关学术论文")
                 else:
                     st.subheader("段落详情")
