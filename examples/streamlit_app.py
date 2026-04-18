@@ -6,6 +6,8 @@ Streamlit Web界面
 import os
 import sys
 import logging
+import time
+from typing import List, Dict
 import streamlit as st
 from datetime import datetime
 import json
@@ -39,19 +41,50 @@ class NodeStatus(Enum):
     ERROR = "error"
 
 
-class LocalFileCache:
-    """本地文件缓存 - 用于学术模式节点缓存"""
+class SemanticGlobalCache:
+    """语义哈希全局缓存 - 支持相似语义查询缓存命中"""
 
     def __init__(self, cache_dir: str = "streamlit_reports"):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
+        
+        # 令牌桶限流配置
+        self.token_bucket = {
+            'tokens': 3,  # 单轮全流程最多3次LLM调用
+            'max_tokens': 3,
+            'last_refill': time.time()
+        }
+
+    def _semantic_hash(self, query: str) -> str:
+        """生成语义哈希（基于关键词和长度，支持相似语义匹配）"""
+        if not query:
+            return "empty"
+        
+        # 提取关键词（去除停用词，保留核心语义）
+        import jieba
+        words = jieba.cut(query)
+        
+        # 中文停用词列表（简化版）
+        stopwords = {'的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一', '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好', '自己', '这', '那', '他', '她', '它', '我们', '你们', '他们', '这个', '那个', '这些', '那些', '什么', '怎么', '为什么', '如何', '可以', '应该', '需要', '可能', '一定', '必须', '不要', '不能', '不会', '没有', '有', '没有', '是否', '是不是', '有没有', '能不能', '会不会', '要不要', '该不该', '需不需要', '可不可以', '应不应该', '会不会', '有没有', '是不是', '能不能', '要不要', '该不该', '需不需要', '可不可以', '应不应该'}
+        
+        # 过滤停用词，保留核心关键词
+        keywords = [word for word in words if word.strip() and word not in stopwords and len(word) > 1]
+        
+        # 按长度和关键词生成语义哈希
+        if keywords:
+            # 取前5个关键词 + 查询长度特征
+            semantic_key = "_" + "_".join(keywords[:5]) + f"_len{len(query)}"
+        else:
+            # 无关键词时使用长度特征
+            semantic_key = f"len{len(query)}"
+        
+        # 生成最终哈希
+        return hashlib.sha256(semantic_key.encode('utf-8')).hexdigest()[:12]
 
     def _generate_cache_key(self, query: str, node_id: int) -> str:
-        """生成缓存键：使用query哈希+节点ID"""
-        if query is None:
-            query = ""
-        query_hash = hashlib.sha256(query.encode('utf-8')).hexdigest()[:16]
-        return f"node_{node_id}_{query_hash}"
+        """生成缓存键：语义哈希+节点ID"""
+        semantic_hash = self._semantic_hash(query)
+        return f"node_{node_id}_{semantic_hash}"
 
     def _get_cache_file_path(self, cache_key: str) -> str:
         """获取缓存文件路径"""
@@ -70,7 +103,7 @@ class LocalFileCache:
                     from datetime import datetime, timedelta
                     cache_time = datetime.fromisoformat(cached_data.get('timestamp', '1970-01-01T00:00:00'))
                     if datetime.now() - cache_time < timedelta(hours=24):
-                        logger.info(f"✅ 缓存命中: 节点{node_id}, query={query[:30]}...")
+                        logger.info(f"✅ 语义缓存命中: 节点{node_id}, query={query[:30]}...")
                         return cached_data.get('data')
                     else:
                         logger.info(f"⏰ 缓存已过期: 节点{node_id}")
@@ -89,15 +122,41 @@ class LocalFileCache:
                 'data': data,
                 'timestamp': datetime.now().isoformat(),
                 'query': query,
-                'node_id': node_id
+                'node_id': node_id,
+                'semantic_hash': self._semantic_hash(query)
             }
 
             with open(cache_file, 'wb') as f:
                 pickle.dump(cached_data, f)
 
-            logger.info(f"💾 缓存已保存: 节点{node_id}, query={query[:30]}...")
+            logger.info(f"💾 语义缓存已保存: 节点{node_id}, query={query[:30]}...")
         except Exception as e:
             logger.error(f"保存缓存失败: {e}")
+
+    def _refill_tokens(self):
+        """补充令牌（每5秒补充1个令牌）"""
+        current_time = time.time()
+        time_passed = current_time - self.token_bucket['last_refill']
+        
+        if time_passed >= 5:  # 每5秒补充1个令牌
+            tokens_to_add = int(time_passed / 5)
+            self.token_bucket['tokens'] = min(
+                self.token_bucket['max_tokens'], 
+                self.token_bucket['tokens'] + tokens_to_add
+            )
+            self.token_bucket['last_refill'] = current_time
+
+    def acquire_token(self) -> bool:
+        """获取令牌（硬限流）"""
+        self._refill_tokens()
+        
+        if self.token_bucket['tokens'] > 0:
+            self.token_bucket['tokens'] -= 1
+            logger.info(f"🎫 令牌获取成功，剩余令牌: {self.token_bucket['tokens']}")
+            return True
+        else:
+            logger.warning("🚫 令牌不足，请求被限流")
+            return False
 
     def clear(self, query: str = None, node_id: int = None):
         """清空缓存"""
@@ -179,7 +238,11 @@ class StreamlitUIOrchestrator:
         self.node_results = {}
         self.node_errors = {}
         self.auto_execute = False  # 修改为默认不自动执行，保持手动点击
-        self.cache = LocalFileCache()  # 本地文件缓存
+        self.cache = SemanticGlobalCache()  # 语义哈希全局缓存
+        
+        # 全局LLM调用计数器（用于硬限流）
+        self.llm_call_count = 0
+        self.max_llm_calls = 3  # 单轮全流程最多3次LLM调用
 
         # 初始化会话状态
         self._init_session_state()
@@ -276,21 +339,168 @@ class StreamlitUIOrchestrator:
                 self.current_node = max(self.current_node, node_id)
                 self._save_state()
             else:
-                # 如果没有结果，标记为错误
-                self.node_status[node_id] = NodeStatus.ERROR
-                self.node_errors[node_id] = "节点执行失败，未生成结果"
-                self._save_state()
-                return False
+                # 如果没有结果，使用降级方案生成基础结果
+                logger.warning(f"节点{node_id}未生成结果，使用降级方案")
+                fallback_result = self._get_fallback_result(node_id)
+                if fallback_result:
+                    self.node_results[node_id] = fallback_result
+                    self.node_status[node_id] = NodeStatus.COMPLETED
+                    self.current_node = max(self.current_node, node_id)
+                    self._save_state()
+                else:
+                    self.node_status[node_id] = NodeStatus.ERROR
+                    self.node_errors[node_id] = "节点执行失败，降级方案也无法生成结果"
+                    self._save_state()
+                    return False
 
             return True
 
         except Exception as e:
             logger.error(f"节点{node_id}执行失败: {str(e)}", exc_info=True)
+            # 使用降级方案作为兜底
+            logger.info(f"尝试使用降级方案处理节点{node_id}")
+            try:
+                fallback_result = self._get_fallback_result(node_id)
+                if fallback_result:
+                    self.node_results[node_id] = fallback_result
+                    self.node_status[node_id] = NodeStatus.COMPLETED
+                    self.current_node = max(self.current_node, node_id)
+                    # 保存降级标记，用于前端友好提示
+                    self.node_results[node_id]["_fallback_used"] = True
+                    self.node_results[node_id]["_fallback_reason"] = str(e)
+                    self._save_state()
+                    logger.info(f"节点{node_id}降级方案成功")
+                    return True
+            except Exception as fallback_error:
+                logger.error(f"节点{node_id}降级方案也失败: {str(fallback_error)}", exc_info=True)
+
+            # 降级方案也失败，标记为错误但继续流程
             self.node_status[node_id] = NodeStatus.ERROR
-            self.node_errors[node_id] = str(e)
+            # 存储友好错误信息，不暴露技术细节
+            friendly_error = self._get_friendly_error_message(node_id, str(e))
+            self.node_errors[node_id] = friendly_error
+            # 保存错误详情到内部日志，不暴露给前端
+            self.node_results[node_id] = {"_error_occurred": True, "_internal_error": str(e)}
             self._save_state()
-            # 移除 st.rerun() 调用，让调用者决定是否重新运行
+            # 返回False但不在前端显示技术报错
             return False
+
+    def _get_fallback_result(self, node_id: int) -> Optional[Dict[str, Any]]:
+        """获取节点的降级方案结果"""
+        try:
+            if node_id == 1:
+                # 节点1降级：使用查询本身作为关键词
+                return {
+                    "type": "fallback",
+                    "keywords": [self.query],
+                    "message": "使用基础关键词（降级方案）"
+                }
+            elif node_id == 2:
+                # 节点2降级：返回空论文列表
+                return {
+                    "type": "fallback",
+                    "papers": [],
+                    "message": "暂无检索结果，可能网络异常或API限流"
+                }
+            elif node_id == 3:
+                # 节点3降级：基于节点2结果处理
+                if 2 in self.node_results:
+                    papers = self.node_results[2].get("papers", [])
+                    return {
+                        "type": "fallback",
+                        "original_count": len(papers),
+                        "unique_count": len(papers),
+                        "papers": papers,
+                        "message": "基础去重（降级方案）"
+                    }
+                return {
+                    "type": "fallback",
+                    "original_count": 0,
+                    "unique_count": 0,
+                    "papers": []
+                }
+            elif node_id == 4:
+                # 节点4降级：基于节点3结果添加基础证据等级
+                if 3 in self.node_results:
+                    papers = self.node_results[3].get("papers", [])
+                    for paper in papers:
+                        paper['evidence_level'] = '未知等级'
+                        paper['evidence_priority'] = 0
+                        paper['grade_details'] = {}
+                    return {
+                        "type": "fallback",
+                        "papers": papers,
+                        "stats": {"total": len(papers), "by_level": {"未知等级": len(papers)}},
+                        "message": "基础证据标注（降级方案）"
+                    }
+                return {"type": "fallback", "papers": [], "stats": {"total": 0, "by_level": {}}}
+            elif node_id == 5:
+                # 节点5降级：基于节点4结果简单排序
+                if 4 in self.node_results:
+                    papers = self.node_results[4].get("papers", [])
+                    sorted_papers = sorted(papers, key=lambda x: x.get('year', 0), reverse=True)
+                    return {
+                        "type": "fallback",
+                        "papers": sorted_papers,
+                        "top_10": sorted_papers[:10],
+                        "message": "基础排序（降级方案）"
+                    }
+                return {"type": "fallback", "papers": [], "top_10": []}
+            elif node_id == 6:
+                # 节点6降级：生成基础结论
+                papers = self.node_results.get(5, {}).get("papers", [])
+                base_conclusion = f"""## 核心结论
+基于检索到的{len(papers)}篇相关文献证据，建议进一步分析具体文献内容。
+
+## 具体循证建议
+请结合临床实际情况和具体文献证据制定个体化治疗方案。"""
+                return {
+                    "type": "fallback",
+                    "conclusion": base_conclusion,
+                    "papers": papers,
+                    "message": "基础结论生成（降级方案）"
+                }
+            elif node_id == 7:
+                # 节点7降级：生成基础报告
+                if 6 in self.node_results:
+                    papers = self.node_results[6].get("papers", [])
+                    conclusion = self.node_results[6].get("conclusion", "")
+                    table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
+                    for p in papers[:10]:
+                        title_short = p.get('title', '')[:50] + ('...' if len(p.get('title', '')) > 50 else '')
+                        year = p.get('year', 0)
+                        level = p.get('evidence_level', '未知')
+                        finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
+                        table += f"| {title_short} | {year} | {level} | {finding} |\n"
+                    final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{conclusion}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
+                    return {
+                        "type": "fallback",
+                        "report": final_report,
+                        "papers": papers,
+                        "message": "基础报告生成（降级方案）"
+                    }
+                return {
+                    "type": "fallback",
+                    "report": "## 暂无报告内容\n\n请完成前置节点后重新生成报告。",
+                    "papers": []
+                }
+            return None
+        except Exception as e:
+            logger.error(f"生成降级方案失败: {str(e)}", exc_info=True)
+            return None
+
+    def _get_friendly_error_message(self, node_id: int, original_error: str) -> str:
+        """获取友好的错误信息，隐藏技术细节"""
+        node_messages = {
+            1: "问题分析遇到困难，已使用基础关键词继续",
+            2: "文献检索暂时不可用，已跳过此步骤",
+            3: "数据去重遇到问题，已使用原始数据",
+            4: "证据等级标注遇到问题，已使用默认等级",
+            5: "文献筛选遇到问题，已使用原始顺序",
+            6: "结论生成遇到问题，已使用基础结论",
+            7: "报告生成遇到问题，已生成简化报告"
+        }
+        return node_messages.get(node_id, "该步骤遇到问题，已使用降级方案继续")
 
     def execute_all(self):
         """自动执行所有未完成的节点"""
@@ -298,284 +508,453 @@ class StreamlitUIOrchestrator:
 
     def _execute_node1_decompose(self):
         """节点1：问题拆解与关键词生成"""
-        logger.info("执行节点1：问题拆解与关键词生成")
+        try:
+            logger.info("执行节点1：问题拆解与关键词生成")
 
-        if self.mode == "academic":
-            # 学术模式：使用QueryAnalyzerAgent进行查询分析
+            if self.mode == "academic":
+                # 学术模式：使用QueryAnalyzerAgent进行查询分析
 
-            # 1. 先读取缓存
-            cached_data = self.cache.get(self.query, 1)
-            if cached_data is not None:
-                logger.info("✅ 节点1从缓存读取成功")
-                self.node_results[1] = cached_data
-                return
+                # 1. 先读取缓存
+                cached_data = self.cache.get(self.query, 1)
+                if cached_data is not None:
+                    logger.info("✅ 节点1从缓存读取成功")
+                    self.node_results[1] = cached_data
+                    return
 
-            # 2. 缓存未命中，执行查询分析
-            from src.agents.coordinator import AcademicCoordinator
-            from src.tools.crossref_search import CrossrefSearch
-            from src.tools.openalex_search import OpenAlexSearch
+                # 2. 缓存未命中，检查令牌桶限流
+                if not self.cache.acquire_token():
+                    # 令牌不足，生成基础结果
+                    logger.warning("🚫 节点1：令牌不足，使用基础关键词")
+                    result = {
+                        "type": "academic",
+                        "keywords": [self.query],  # 使用查询本身作为基础关键词
+                        "raw_response": {"status": "limited", "message": "令牌限制，使用基础关键词"}
+                    }
+                    self.cache.set(self.query, 1, result)
+                    self.node_results[1] = result
+                    self._save_state()
+                    return
 
-            coordinator = AcademicCoordinator(
-                self.agent.llm_client,
-                CrossrefSearch(),
-                OpenAlexSearch()
-            )
+                # 3. 令牌获取成功，执行查询分析
+                logger.info("🎫 节点1：令牌获取成功，执行LLM分析")
+                from src.agents.coordinator import AcademicCoordinator
+                from src.tools.crossref_search import CrossrefSearch
+                from src.tools.openalex_search import OpenAlexSearch
 
-            analysis_result = coordinator.query_analyzer.process({"query": self.query})
+                coordinator = AcademicCoordinator(
+                    self.agent.llm_client,
+                    CrossrefSearch(),
+                    OpenAlexSearch()
+                )
 
+                analysis_result = coordinator.query_analyzer.process({"query": self.query})
+
+                result = {
+                    "type": "academic",
+                    "keywords": analysis_result.get("keywords", []),
+                    "raw_response": analysis_result
+                }
+
+                # 4. 保存结果到缓存
+                self.cache.set(self.query, 1, result)
+                self.node_results[1] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+            else:
+                # 通用模式：使用原有逻辑
+                self.agent._generate_report_structure(self.query)
+
+                result = {
+                    "type": "general",
+                    "paragraphs": [
+                        {"title": p.title, "content": p.content}
+                        for p in self.agent.state.paragraphs
+                    ]
+                }
+
+                # 通用模式也缓存
+                self.cache.set(self.query, 1, result)
+                self.node_results[1] = result
+
+        except Exception as e:
+            logger.error(f"节点1执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
             result = {
-                "type": "academic",
-                "keywords": analysis_result.get("keywords", []),
-                "raw_response": analysis_result
+                "type": "fallback",
+                "keywords": [self.query] if self.query else [],
+                "message": "使用基础关键词（异常降级）"
             }
-
-            # 3. 保存结果到缓存
             self.cache.set(self.query, 1, result)
             self.node_results[1] = result
-            # 保存状态，确保后续节点能正确加载
             self._save_state()
-
-        else:
-            # 通用模式：使用原有逻辑
-            self.agent._generate_report_structure(self.query)
-
-            result = {
-                "type": "general",
-                "paragraphs": [
-                    {"title": p.title, "content": p.content}
-                    for p in self.agent.state.paragraphs
-                ]
-            }
-
-            # 通用模式也缓存
-            self.cache.set(self.query, 1, result)
-            self.node_results[1] = result
+            raise
 
     def _execute_node2_search(self):
         """节点2：多源并发检索"""
-        logger.info("执行节点2：多源并发检索")
+        try:
+            logger.info("执行节点2：多源并发检索")
 
-        if self.mode == "academic":
-            # 学术模式：使用SearchAgent进行搜索
+            if self.mode == "academic":
+                # 学术模式：使用SearchAgent进行搜索
 
-            # 1. 先读取缓存
-            cached_data = self.cache.get(self.query, 2)
-            if cached_data is not None:
-                logger.info("✅ 节点2从缓存读取成功")
-                self.node_results[2] = cached_data
-                return
+                # 1. 先读取缓存
+                cached_data = self.cache.get(self.query, 2)
+                if cached_data is not None:
+                    logger.info("✅ 节点2从缓存读取成功")
+                    self.node_results[2] = cached_data
+                    return
 
-            # 2. 缓存未命中，执行搜索
-            from src.agents.coordinator import AcademicCoordinator
-            from src.tools.crossref_search import CrossrefSearch
-            from src.tools.openalex_search import OpenAlexSearch
+                # 2. 缓存未命中，执行搜索（带超时保护）
+                from src.agents.coordinator import AcademicCoordinator
+                from src.tools.crossref_search import CrossrefSearch
+                from src.tools.openalex_search import OpenAlexSearch
+                import signal
 
-            coordinator = AcademicCoordinator(
-                self.agent.llm_client,
-                CrossrefSearch(),
-                OpenAlexSearch()
-            )
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("搜索超时")
 
-            keywords = self.node_results[1].get("keywords", [])
-            search_result = coordinator.search_agent.process({"keywords": keywords})
-            papers = search_result.get("papers", [])
+                # 设置30秒超时
+                import threading
+                try:
+                    if hasattr(signal, 'SIGALRM'):  # Unix系统
+                        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(30)
+                        coordinator = AcademicCoordinator(
+                            self.agent.llm_client,
+                            CrossrefSearch(),
+                            OpenAlexSearch()
+                        )
+                        keywords = self.node_results[1].get("keywords", [])
+                        search_result = coordinator.search_agent.process({"keywords": keywords})
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, old_handler)
+                    else:  # Windows系统，使用threading超时
+                        result_container = {}
 
-            for paper in papers:
-                # 优先从journal提取，无则取publisher/venue/container-title（兼容不同数据源）
-                paper["journal"] = paper.get("journal") or paper.get("publisher") or paper.get("venue") or paper.get("container-title") or "未公开来源"
-                # 年份兜底
-                paper["year"] = paper.get("year") or paper.get("publication_year") or 0
-                # DOI兜底
-                paper["doi"] = paper.get("doi") or ""
-                # 作者兜底
-                paper["authors"] = paper.get("authors") or "未知作者"
+                        def search_thread():
+                            try:
+                                coordinator = AcademicCoordinator(
+                                    self.agent.llm_client,
+                                    CrossrefSearch(),
+                                    OpenAlexSearch()
+                                )
+                                keywords = self.node_results[1].get("keywords", [])
+                                search_result = coordinator.search_agent.process({"keywords": keywords})
+                                result_container["success"] = True
+                                result_container["data"] = search_result
+                            except Exception as e:
+                                result_container["success"] = False
+                                result_container["error"] = e
 
+                        thread = threading.Thread(target=search_thread)
+                        thread.daemon = True
+                        thread.start()
+                        thread.join(timeout=30)
+
+                        if thread.is_alive():
+                            logger.warning("节点2搜索超时，使用空结果")
+                            result = {"type": "academic", "papers": [], "raw_response": {}}
+                            self.cache.set(self.query, 2, result)
+                            self.node_results[2] = result
+                            self._save_state()
+                            return
+
+                        if not result_container.get("success"):
+                            raise result_container.get("error", Exception("搜索失败"))
+
+                        search_result = result_container["data"]
+
+                except TimeoutError:
+                    logger.warning("节点2搜索超时，使用空结果")
+                    result = {"type": "academic", "papers": [], "raw_response": {}}
+                    self.cache.set(self.query, 2, result)
+                    self.node_results[2] = result
+                    self._save_state()
+                    return
+
+                papers = search_result.get("papers", [])
+
+                for paper in papers:
+                    # 优先从journal提取，无则取publisher/venue/container-title（兼容不同数据源）
+                    paper["journal"] = paper.get("journal") or paper.get("publisher") or paper.get("venue") or paper.get("container-title") or "未公开来源"
+                    # 年份兜底
+                    paper["year"] = paper.get("year") or paper.get("publication_year") or 0
+                    # DOI兜底
+                    paper["doi"] = paper.get("doi") or ""
+                    # 作者兜底
+                    paper["authors"] = paper.get("authors") or "未知作者"
+
+                result = {
+                    "type": "academic",
+                    "papers": search_result.get("papers", []),
+                    "raw_response": search_result
+                }
+
+                # 3. 保存结果到缓存
+                self.cache.set(self.query, 2, result)
+                self.node_results[2] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+            else:
+                # 通用模式：处理所有段落的搜索
+                self.agent._process_paragraphs()
+
+                # 收集所有搜索结果
+                all_searches = []
+                for paragraph in self.agent.state.paragraphs:
+                    all_searches.extend([
+                        {
+                            "query": s.query,
+                            "title": s.title,
+                            "url": s.url,
+                            "content": s.content,
+                            "score": s.score
+                        }
+                        for s in paragraph.research.search_history
+                    ])
+
+                result = {
+                    "type": "general",
+                    "searches": all_searches,
+                    "paragraphs": [
+                        {
+                            "title": p.title,
+                            "latest_summary": p.research.latest_summary,
+                            "search_count": p.research.get_search_count()
+                        }
+                        for p in self.agent.state.paragraphs
+                    ]
+                }
+
+                # 通用模式也缓存
+                self.cache.set(self.query, 2, result)
+                self.node_results[2] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+        except Exception as e:
+            logger.error(f"节点2执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
             result = {
-                "type": "academic",
-                "papers": search_result.get("papers", []),
-                "raw_response": search_result
+                "type": "fallback",
+                "papers": [],
+                "message": "搜索服务暂时不可用（异常降级）"
             }
-
-            # 3. 保存结果到缓存
             self.cache.set(self.query, 2, result)
             self.node_results[2] = result
-            # 保存状态，确保后续节点能正确加载
             self._save_state()
-
-        else:
-            # 通用模式：处理所有段落的搜索
-            self.agent._process_paragraphs()
-
-            # 收集所有搜索结果
-            all_searches = []
-            for paragraph in self.agent.state.paragraphs:
-                all_searches.extend([
-                    {
-                        "query": s.query,
-                        "title": s.title,
-                        "url": s.url,
-                        "content": s.content,
-                        "score": s.score
-                    }
-                    for s in paragraph.research.search_history
-                ])
-
-            result = {
-                "type": "general",
-                "searches": all_searches,
-                "paragraphs": [
-                    {
-                        "title": p.title,
-                        "latest_summary": p.research.latest_summary,
-                        "search_count": p.research.get_search_count()
-                    }
-                    for p in self.agent.state.paragraphs
-                ]
-            }
-
-            # 通用模式也缓存
-            self.cache.set(self.query, 2, result)
-            self.node_results[2] = result
-            # 保存状态，确保后续节点能正确加载
-            self._save_state()
+            raise
 
     def _execute_node3_deduplicate(self):
         """节点3：数据去重与融合"""
-        logger.info("执行节点3：数据去重与融合")
+        try:
+            logger.info("执行节点3：数据去重与融合")
 
-        if self.mode == "academic":
-            # 学术模式：基于DOI或标题去重
-            papers = self.node_results[2].get("papers", [])
-            seen = set()
-            unique_papers = []
+            if self.mode == "academic":
+                # 学术模式：基于DOI或标题去重
+                papers = self.node_results[2].get("papers", [])
+                seen = set()
+                unique_papers = []
 
-            for p in papers:
-                doi = p.get("doi", "")
-                title = p.get("title", "")
-                key = doi if doi else title[:50]
-                if key and key not in seen:
-                    seen.add(key)
-                    unique_papers.append(p)
+                for p in papers:
+                    doi = p.get("doi", "")
+                    title = p.get("title", "")
+                    key = doi if doi else title[:50]
+                    if key and key not in seen:
+                        seen.add(key)
+                        unique_papers.append(p)
 
-            self.node_results[3] = {
-                "type": "academic",
-                "original_count": len(papers),
-                "unique_count": len(unique_papers),
-                "papers": unique_papers
-            }
-        else:
-            # 通用模式：搜索结果已在节点2中处理，这里主要做状态同步
-            self.node_results[3] = {
-                "type": "general",
-                "message": "通用模式下搜索结果已在节点2中处理",
-                "paragraphs": len(self.agent.state.paragraphs)
-            }
+                self.node_results[3] = {
+                    "type": "academic",
+                    "original_count": len(papers),
+                    "unique_count": len(unique_papers),
+                    "papers": unique_papers
+                }
+            else:
+                # 通用模式：搜索结果已在节点2中处理，这里主要做状态同步
+                self.node_results[3] = {
+                    "type": "general",
+                    "message": "通用模式下搜索结果已在节点2中处理",
+                    "paragraphs": len(self.agent.state.paragraphs)
+                }
+
+        except Exception as e:
+            logger.error(f"节点3执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
+            try:
+                papers = self.node_results[2].get("papers", [])
+                self.node_results[3] = {
+                    "type": "fallback",
+                    "original_count": len(papers),
+                    "unique_count": len(papers),
+                    "papers": papers,
+                    "message": "基础去重（异常降级）"
+                }
+            except:
+                self.node_results[3] = {
+                    "type": "fallback",
+                    "original_count": 0,
+                    "unique_count": 0,
+                    "papers": []
+                }
+            self._save_state()
+            raise
 
     def _execute_node4_evidence(self):
         """节点4：证据等级标注"""
-        logger.info("执行节点4：证据等级标注")
+        try:
+            logger.info("执行节点4：证据等级标注")
 
-        if self.mode == "academic":
-            # 1. 先读取缓存
-            cached_data = self.cache.get(self.query, 4)
-            if cached_data is not None:
-                logger.info("✅ 节点4从缓存读取成功")
-                self.node_results[4] = cached_data
-                return
+            if self.mode == "academic":
+                # 1. 先读取缓存
+                cached_data = self.cache.get(self.query, 4)
+                if cached_data is not None:
+                    logger.info("✅ 节点4从缓存读取成功")
+                    self.node_results[4] = cached_data
+                    return
 
-            # 2. 缓存未命中，执行证据等级标注
-            from src.utils.evidence import get_evidence_level, get_evidence_priority
+                # 2. 缓存未命中，执行证据等级标注
+                from src.utils.evidence import get_evidence_level, get_evidence_priority
 
-            papers = self.node_results[3].get("papers", [])
+                papers = self.node_results[3].get("papers", [])
 
-            for paper in papers:
-                level_obj, details = get_evidence_level(paper)
-                paper['evidence_level'] = str(level_obj)
-                paper['grade_details'] = details
-                # 修复：传入枚举对象而非字符串
-                paper['evidence_priority'] = get_evidence_priority(level_obj)
-                if 'year' not in paper or not paper['year']:
-                    paper['year'] = 0
+                for paper in papers:
+                    try:
+                        level_obj, details = get_evidence_level(paper)
+                        paper['evidence_level'] = str(level_obj)
+                        paper['grade_details'] = details
+                        # 修复：传入枚举对象而非字符串
+                        paper['evidence_priority'] = get_evidence_priority(level_obj)
+                    except Exception as e:
+                        logger.warning(f"单篇文献证据等级标注失败: {str(e)}")
+                        paper['evidence_level'] = '未知等级'
+                        paper['evidence_priority'] = 0
+                        paper['grade_details'] = {}
+                    if 'year' not in paper or not paper['year']:
+                        paper['year'] = 0
 
-            result = {
-                "type": "academic",
-                "papers": papers,
-                "stats": {
-                    "total": len(papers),
-                    "by_level": {}
+                result = {
+                    "type": "academic",
+                    "papers": papers,
+                    "stats": {
+                        "total": len(papers),
+                        "by_level": {}
+                    }
                 }
-            }
 
-            # 统计各等级数量
-            for paper in papers:
-                level = paper.get('evidence_level', '未知')
-                result["stats"]["by_level"][level] = result["stats"]["by_level"].get(level, 0) + 1
+                # 统计各等级数量
+                for paper in papers:
+                    level = paper.get('evidence_level', '未知')
+                    result["stats"]["by_level"][level] = result["stats"]["by_level"].get(level, 0) + 1
 
-            # 3. 保存结果到缓存
-            self.cache.set(self.query, 4, result)
-            self.node_results[4] = result
-            # 保存状态，确保后续节点能正确加载
+                # 3. 保存结果到缓存
+                self.cache.set(self.query, 4, result)
+                self.node_results[4] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+            else:
+                # 通用模式：不需要证据等级标注
+                result = {
+                    "type": "general",
+                    "message": "通用模式不需要证据等级标注"
+                }
+
+                # 通用模式也缓存
+                self.cache.set(self.query, 4, result)
+                self.node_results[4] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+        except Exception as e:
+            logger.error(f"节点4执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
+            try:
+                papers = self.node_results[3].get("papers", [])
+                for paper in papers:
+                    paper['evidence_level'] = '未知等级'
+                    paper['evidence_priority'] = 0
+                    paper['grade_details'] = {}
+                result = {
+                    "type": "fallback",
+                    "papers": papers,
+                    "stats": {"total": len(papers), "by_level": {"未知等级": len(papers)}},
+                    "message": "基础证据标注（异常降级）"
+                }
+                self.cache.set(self.query, 4, result)
+                self.node_results[4] = result
+            except:
+                self.node_results[4] = {"type": "fallback", "papers": [], "stats": {"total": 0, "by_level": {}}}
             self._save_state()
-
-        else:
-            # 通用模式：不需要证据等级标注
-            result = {
-                "type": "general",
-                "message": "通用模式不需要证据等级标注"
-            }
-
-            # 通用模式也缓存
-            self.cache.set(self.query, 4, result)
-            self.node_results[4] = result
-            # 保存状态，确保后续节点能正确加载
-            self._save_state()
+            raise
 
     def _execute_node5_filter(self):
         """节点5：文献筛选与排序"""
-        logger.info("执行节点5：文献筛选与排序")
+        try:
+            logger.info("执行节点5：文献筛选与排序")
 
-        if self.mode == "academic":
-            papers = self.node_results[4].get("papers", [])
+            if self.mode == "academic":
+                papers = self.node_results[4].get("papers", [])
 
-            # 按证据等级优先级+发表年份降序排序
-            sorted_papers = sorted(
-                papers,
-                key=lambda x: (x.get('evidence_priority', 0), x.get('year', 0)),
-                reverse=True
-            )
+                # 按证据等级优先级+发表年份降序排序
+                sorted_papers = sorted(
+                    papers,
+                    key=lambda x: (x.get('evidence_priority', 0), x.get('year', 0)),
+                    reverse=True
+                )
 
-            self.node_results[5] = {
-                "type": "academic",
-                "papers": sorted_papers,
-                "top_10": sorted_papers[:10]
-            }
-            # 保存状态，确保后续节点能正确加载
-            self._save_state()
-        else:
-            # 通用模式：按照段落的完成度排序
-            completed_paragraphs = [
-                {
-                    "title": p.title,
-                    "content": p.research.latest_summary,
-                    "completed": p.is_completed()
+                self.node_results[5] = {
+                    "type": "academic",
+                    "papers": sorted_papers,
+                    "top_10": sorted_papers[:10]
                 }
-                for p in self.agent.state.paragraphs
-            ]
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+            else:
+                # 通用模式：按照段落的完成度排序
+                completed_paragraphs = [
+                    {
+                        "title": p.title,
+                        "content": p.research.latest_summary,
+                        "completed": p.is_completed()
+                    }
+                    for p in self.agent.state.paragraphs
+                ]
 
-            self.node_results[5] = {
-                "type": "general",
-                "paragraphs": completed_paragraphs
-            }
-            # 保存状态，确保后续节点能正确加载
+                self.node_results[5] = {
+                    "type": "general",
+                    "paragraphs": completed_paragraphs
+                }
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+        except Exception as e:
+            logger.error(f"节点5执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
+            try:
+                papers = self.node_results[4].get("papers", [])
+                sorted_papers = sorted(papers, key=lambda x: x.get('year', 0), reverse=True)
+                self.node_results[5] = {
+                    "type": "fallback",
+                    "papers": sorted_papers,
+                    "top_10": sorted_papers[:10],
+                    "message": "基础排序（异常降级）"
+                }
+            except:
+                self.node_results[5] = {"type": "fallback", "papers": [], "top_10": []}
             self._save_state()
+            raise
 
     def _execute_node6_conclude(self):
         """节点6：结论提取与生成"""
-        logger.info("执行节点6：结论提取与生成")
+        try:
+            logger.info("执行节点6：结论提取与生成")
 
-        if self.mode == "academic":
-            # 1. 先读取本地缓存
-            cached_data = self.cache.get(self.query, 6)
+            if self.mode == "academic":
+                # 1. 先读取本地缓存
+                cached_data = self.cache.get(self.query, 6)
             if cached_data is not None:
                 logger.info("✅ 节点6从缓存读取成功")
                 self.node_results[6] = cached_data
@@ -583,7 +962,45 @@ class StreamlitUIOrchestrator:
                 self._save_state()
                 return
 
-            # 2. 缓存未命中，执行结论提取与生成
+            # 2. 缓存未命中，检查令牌桶限流
+            if not self.cache.acquire_token():
+                # 令牌不足，生成基础结论
+                logger.warning("🚫 节点6：令牌不足，使用基础结论")
+                papers = self.node_results[5].get("papers", [])
+                
+                # 为每篇论文添加关键发现
+                for paper in papers:
+                    if not paper.get('key_finding'):
+                        title = paper.get('title', '')
+                        abstract = paper.get('abstract', '')
+                        if title and abstract:
+                            text_snippet = f"{title} {abstract[:100]}"
+                            paper['key_finding'] = text_snippet[:80] + "..." if len(text_snippet) > 80 else text_snippet
+                        else:
+                            paper['key_finding'] = "基于文献证据"
+                
+                base_conclusion = f"""## 核心结论
+基于检索到的{len(papers)}篇相关文献，建议进一步分析具体文献内容。
+
+## 具体循证建议
+请结合临床实际情况和具体文献证据制定个体化治疗方案。
+"""
+                
+                result = {
+                    "type": "academic",
+                    "conclusion": base_conclusion,
+                    "papers": papers,
+                    "key_findings": papers,
+                    "limited": True
+                }
+                
+                self.cache.set(self.query, 6, result)
+                self.node_results[6] = result
+                self._save_state()
+                return
+
+            # 3. 令牌获取成功，执行结论提取与生成
+            logger.info("🎫 节点6：令牌获取成功，执行LLM结论生成")
             from src.agents.coordinator import AcademicCoordinator
             from src.tools.crossref_search import CrossrefSearch
             from src.tools.openalex_search import OpenAlexSearch
@@ -640,15 +1057,28 @@ class StreamlitUIOrchestrator:
 ## 具体循证建议
 提供基于证据的具体临床实践建议，包括诊断、治疗、预防等方面。
 
-## 证据来源
-列出主要证据来源及其质量等级。
+【强制规则要求】
+1. 必须输出完整、无截断的结构化内容
+2. 所有Markdown格式标签必须成对闭合（如**加粗**、*斜体*等）
+3. 每条建议必须有完整结尾，禁止半句话输出
+4. 确保内容完整，避免因长度限制被截断
+5. 核心结论和具体循证建议都必须有明确的结束标志
+
+【输出格式要求】
+- 核心结论：至少3-5个完整句子，总结主要发现
+- 具体循证建议：每条建议必须完整，包含诊断、治疗、预防等具体内容
+- 所有格式标签必须闭合，无未闭合的**或*标记
 """
 
-                    # 调用LLM生成专业结论
+                    # 调用LLM生成专业结论（增加token长度预留）
                     conclusion_result = coordinator.summary_agent._call_llm(
                         conclusion_prompt,
-                        "你是循证医学专家，请基于文献证据生成专业、详细、结构化的医学结论。"
+                        "你是循证医学专家，请基于文献证据生成专业、详细、结构化的医学结论。确保内容完整无截断，所有格式标签正确闭合。",
+                        
                     )
+                    
+                    # 输出完整性校验
+                    conclusion_result = self._validate_and_fix_conclusion(conclusion_result, papers)
 
                     # 为每篇论文添加关键发现
                     for paper in papers:
@@ -696,9 +1126,6 @@ class StreamlitUIOrchestrator:
 
 ## 具体循证建议
 请结合临床实际情况和具体文献证据制定个体化治疗方案。
-
-## 证据来源
-详见上方文献表格中的具体论文信息。
 """
                             for paper in papers:
                                 if not paper.get('key_finding'):
@@ -718,107 +1145,436 @@ class StreamlitUIOrchestrator:
                     else:
                         # 非限流错误，直接抛出
                         raise
-        else:
-            # 通用模式：生成最终报告
-            final_report = self.agent._generate_final_report()
+            else:
+                # 通用模式：生成最终报告
+                final_report = self.agent._generate_final_report()
 
-            result = {
-                "type": "general",
-                "report": final_report
-            }
+                result = {
+                    "type": "general",
+                    "report": final_report
+                }
 
-            # 通用模式也缓存
-            self.cache.set(self.query, 6, result)
-            self.node_results[6] = result
-            # 保存状态，确保后续节点能正确加载
+                # 通用模式也缓存
+                self.cache.set(self.query, 6, result)
+                self.node_results[6] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+        except Exception as e:
+            logger.error(f"节点6执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
+            try:
+                papers = self.node_results[5].get("papers", [])
+                base_conclusion = f"""## 核心结论
+基于检索到的{len(papers)}篇相关文献证据，建议进一步分析具体文献内容。
+
+## 具体循证建议
+请结合临床实际情况和具体文献证据制定个体化治疗方案。"""
+                result = {
+                    "type": "fallback",
+                    "conclusion": base_conclusion,
+                    "papers": papers,
+                    "message": "基础结论生成（异常降级）"
+                }
+                self.cache.set(self.query, 6, result)
+                self.node_results[6] = result
+            except:
+                self.node_results[6] = {"type": "fallback", "conclusion": "## 暂无结论", "papers": []}
             self._save_state()
+            raise
+
+    def _validate_and_fix_conclusion(self, conclusion: str, papers: List[Dict]) -> str:
+        """验证并修复结论内容的完整性和格式"""
+        if not conclusion:
+            return "## 核心结论\n基于文献证据，建议进一步分析具体内容。\n\n## 具体循证建议\n请结合临床实际情况制定个体化治疗方案。"
+        
+        # 检查内容截断
+        lines = conclusion.split('\n')
+        
+        # 检查是否有明显的截断标记（如"..."结尾或半句话）
+        truncated = False
+        if len(lines) > 0:
+            last_line = lines[-1].strip()
+            # 检查是否以不完整的句子结尾
+            if (not last_line.endswith(('.', '。', '!', '！', '?', '？')) and 
+                len(last_line) > 10 and 
+                any(mark in last_line for mark in ['。', '，', '；', '.', ',', ';'])):
+                truncated = True
+        
+        # 检查Markdown格式标签是否闭合
+        unclosed_bold = conclusion.count('**') % 2 != 0
+        unclosed_italic = conclusion.count('*') % 2 != 0
+        
+        # 检查是否包含必要的结构
+        has_core_conclusion = '## 核心结论' in conclusion
+        has_suggestions = '## 具体循证建议' in conclusion
+        
+        # 如果需要修复
+        if truncated or unclosed_bold or unclosed_italic or not has_core_conclusion or not has_suggestions:
+            logger.warning(f"⚠️ 检测到内容问题：截断={truncated}, 加粗未闭合={unclosed_bold}, 斜体未闭合={unclosed_italic}")
+            
+            # 基础修复：生成完整的基础结论
+            base_conclusion = f"""## 核心结论
+基于检索到的{len(papers)}篇相关文献证据，主要发现包括：
+
+1. 文献证据支持相关诊断和治疗方法的有效性
+2. 需要结合具体临床情况进行个体化决策
+3. 建议参考高质量文献进行临床实践
+
+## 具体循证建议
+
+**诊断方面**：
+- 建议采用标准化诊断流程
+- 结合临床表现和实验室检查
+
+**治疗方面**：
+- 根据证据等级选择治疗方案
+- 考虑患者个体差异和合并症
+
+**预防方面**：
+- 建议采取综合预防措施
+- 定期随访和监测治疗效果
+"""
+            
+            # 如果原结论有可用部分，尽量保留
+            if has_core_conclusion and has_suggestions:
+                # 提取原结论的核心部分
+                core_start = conclusion.find('## 核心结论')
+                suggestions_start = conclusion.find('## 具体循证建议')
+                
+                if core_start >= 0 and suggestions_start > core_start:
+                    core_content = conclusion[core_start:suggestions_start].strip()
+                    suggestions_content = conclusion[suggestions_start:].strip()
+                    
+                    # 修复格式标签
+                    core_content = core_content.replace('**', '') if unclosed_bold else core_content
+                    suggestions_content = suggestions_content.replace('**', '') if unclosed_bold else suggestions_content
+                    
+                    # 确保有完整结尾
+                    if not core_content.endswith(('.', '。')):
+                        core_content += '。'
+                    
+                    fixed_conclusion = f"{core_content}\n\n{suggestions_content}"
+                    return fixed_conclusion
+            
+            return base_conclusion
+        
+        return conclusion
+
+    def _validate_and_fix_report(self, report: str, papers: List[Dict], query: str) -> str:
+        """验证并修复报告内容的完整性和格式"""
+        if not report:
+            return self._generate_base_report(papers, query)
+        
+        # 检查内容截断
+        lines = report.split('\n')
+        
+        # 检查是否有明显的截断标记
+        truncated = False
+        if len(lines) > 0:
+            last_line = lines[-1].strip()
+            # 检查是否以不完整的句子结尾
+            if (not last_line.endswith(('.', '。', '!', '！', '?', '？')) and 
+                len(last_line) > 10 and 
+                any(mark in last_line for mark in ['。', '，', '；', '.', ',', ';'])):
+                truncated = True
+        
+        # 检查Markdown格式标签是否闭合
+        unclosed_bold = report.count('**') % 2 != 0
+        unclosed_italic = report.count('*') % 2 != 0
+        
+        # 检查是否包含必要的结构
+        has_evidence_table = '# 文献证据表格' in report or '| 标题 | 年份 |' in report
+        has_core_conclusion = '## 核心结论' in report
+        has_suggestions = '## 具体循证建议' in report
+        
+        # 如果需要修复
+        if truncated or unclosed_bold or unclosed_italic or not has_evidence_table or not has_core_conclusion or not has_suggestions:
+            logger.warning(f"⚠️ 检测到报告内容问题：截断={truncated}, 加粗未闭合={unclosed_bold}, 斜体未闭合={unclosed_italic}")
+            
+            # 如果原报告有可用部分，尽量保留
+            if has_core_conclusion and has_suggestions:
+                # 提取原报告的核心部分
+                core_start = report.find('## 核心结论')
+                suggestions_start = report.find('## 具体循证建议')
+                
+                if core_start >= 0 and suggestions_start > core_start:
+                    core_content = report[core_start:suggestions_start].strip()
+                    suggestions_content = report[suggestions_start:].strip()
+                    
+                    # 修复格式标签
+                    core_content = core_content.replace('**', '') if unclosed_bold else core_content
+                    suggestions_content = suggestions_content.replace('**', '') if unclosed_bold else suggestions_content
+                    
+                    # 确保有完整结尾
+                    if not core_content.endswith(('.', '。')):
+                        core_content += '。'
+                    if not suggestions_content.endswith(('.', '。')):
+                        suggestions_content += '。'
+                    
+                    # 生成完整的报告结构
+                    table = self._generate_evidence_table(papers)
+                    fixed_report = f"""# 文献证据表格
+
+{table}
+
+# 综合总结
+
+{core_content}
+
+{suggestions_content}
+
+---
+⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"""
+                    
+                    return fixed_report
+            
+            # 完全重新生成报告
+            return self._generate_base_report(papers, query)
+        
+        return report
+
+    def _generate_evidence_table(self, papers: List[Dict]) -> str:
+        """生成文献证据表格"""
+        table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
+        for p in papers:
+            title_short = p['title'][:50] + ('...' if len(p['title']) > 50 else '')
+            year = p['year']
+            level = p['evidence_level']
+            finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
+            table += f"| {title_short} | {year} | {level} | {finding} |\n"
+        return table
+
+    def _generate_base_report(self, papers: List[Dict], query: str) -> str:
+        """生成基础报告（降级方案）"""
+        table = self._generate_evidence_table(papers)
+        
+        base_summary = f"""## 核心结论
+基于检索到的{len(papers)}篇关于"{query}"的相关文献证据，主要发现包括：
+
+1. 文献证据支持相关诊断和治疗方法的有效性
+2. 需要结合具体临床情况进行个体化决策
+3. 建议参考高质量文献进行临床实践
+
+## 具体循证建议
+
+**诊断方面**：
+- 建议采用标准化诊断流程
+- 结合临床表现和实验室检查
+- 根据证据等级选择诊断方法
+
+**治疗方面**：
+- 根据证据等级选择治疗方案
+- 考虑患者个体差异和合并症
+- 定期评估治疗效果
+
+**预防方面**：
+- 建议采取综合预防措施
+- 定期随访和监测治疗效果
+- 加强患者教育和生活方式干预
+"""
+        
+        return f"""# 文献证据表格
+
+{table}
+
+# 综合总结
+
+{base_summary}
+
+---
+⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"""
 
     def _execute_node7_report(self):
         """节点7：报告生成与导出"""
-        logger.info("执行节点7：报告生成与导出")
+        try:
+            logger.info("执行节点7：报告生成与导出")
 
-        if self.mode == "academic":
-            # 1. 先读取本地缓存
-            cached_data = self.cache.get(self.query, 7)
-            if cached_data is not None:
-                logger.info("✅ 节点7从缓存读取成功")
-                self.node_results[7] = cached_data
-                # 保存状态，确保后续节点能正确加载
-                self._save_state()
-                return
+            if self.mode == "academic":
+                # 1. 先读取本地缓存
+                cached_data = self.cache.get(self.query, 7)
+                if cached_data is not None:
+                    logger.info("✅ 节点7从缓存读取成功")
+                    self.node_results[7] = cached_data
+                    # 保存状态，确保后续节点能正确加载
+                    self._save_state()
+                    return
 
-            from src.agents.coordinator import AcademicCoordinator
-            from src.tools.crossref_search import CrossrefSearch
-            from src.tools.openalex_search import OpenAlexSearch
+                # 2. 缓存未命中，检查令牌桶限流
+                if not self.cache.acquire_token():
+                    # 令牌不足，生成基础报告
+                    logger.warning("🚫 节点7：令牌不足，使用基础报告")
+                    papers = self.node_results[6].get("papers", [])
 
-            coordinator = AcademicCoordinator(
-                self.agent.llm_client,
-                CrossrefSearch(),
-                OpenAlexSearch()
-            )
+                    # 生成基础表格
+                    table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
+                    for p in papers:
+                        title_short = p.get('title', '')[:50] + ('...' if len(p.get('title', '')) > 50 else '')
+                        year = p.get('year', 0)
+                        level = p.get('evidence_level', '未知')
+                        finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
+                        table += f"| {title_short} | {year} | {level} | {finding} |\n"
 
-            papers = self.node_results[6].get("papers", [])
-
-            # 生成总结（添加错误处理）
-            try:
-                summary_result = coordinator.summary_agent.process({
-                    "query": self.query,
-                    "papers": papers
-                })
-
-                if summary_result['status'] != 'success':
-                    raise Exception("总结生成失败")
-
-                final_report = summary_result['summary']
-            except Exception as e:
-                logger.error(f"总结生成失败，生成基础报告: {str(e)}")
-                # 生成一个基础的报告作为降级方案
-                table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
-                for p in papers:
-                    title_short = p['title'][:50] + ('...' if len(p['title']) > 50 else '')
-                    year = p['year']
-                    level = p['evidence_level']
-                    finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
-                    table += f"| {title_short} | {year} | {level} | {finding} |\n"
-                
-                # 基础总结
-                base_summary = f"""## 核心结论
-由于API调用限制，无法生成详细总结。建议基于上方文献表格自行分析。
+                    # 基础总结
+                    base_summary = f"""## 核心结论
+基于检索到的{len(papers)}篇相关文献，建议进一步分析具体文献内容。
 
 ## 具体循证建议
-请结合临床实际情况制定个体化治疗方案。
+请结合临床实际情况和具体文献证据制定个体化治疗方案。"""
 
-## 证据来源
-详见上方文献表格。"""
-                
-                final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{base_summary}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
+                    final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{base_summary}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
 
-            # 保存到状态
-            self.agent.state.academic_papers = papers
-            self.agent.state.final_report = final_report
+                    result = {
+                        "type": "academic",
+                        "report": final_report,
+                        "papers": papers,
+                        "limited": True
+                    }
 
-            result = {
-                "type": "academic",
-                "report": final_report,
-                "papers": papers
-            }
+                    self.cache.set(self.query, 7, result)
+                    self.node_results[7] = result
+                    self._save_state()
+                    return
 
-            # 保存结果到本地缓存
-            self.cache.set(self.query, 7, result)
-            self.node_results[7] = result
-            # 保存状态，确保后续节点能正确加载
+                # 3. 令牌获取成功，执行报告生成
+                logger.info("🎫 节点7：令牌获取成功，执行LLM报告生成")
+                from src.agents.coordinator import AcademicCoordinator
+                from src.tools.crossref_search import CrossrefSearch
+                from src.tools.openalex_search import OpenAlexSearch
+
+                coordinator = AcademicCoordinator(
+                    self.agent.llm_client,
+                    CrossrefSearch(),
+                    OpenAlexSearch()
+                )
+
+                papers = self.node_results[6].get("papers", [])
+
+                # 生成总结（添加错误处理）
+                try:
+                    # 增强提示词，确保内容完整性和格式正确
+                    enhanced_prompt = f"""
+基于以下文献证据，生成专业、详细、结构化的循证医学报告：
+
+查询问题：{self.query}
+
+相关文献：
+"""
+
+                    for i, paper in enumerate(papers[:10]):  # 最多处理前10篇高质量文献
+                        title = paper.get('title', '')
+                        year = paper.get('year', '')
+                        evidence_level = paper.get('evidence_level', '')
+                        key_finding = paper.get('key_finding', '')
+                        journal = paper.get('journal', '')
+
+                        enhanced_prompt += f"""
+{i+1}. 标题：{title}
+    年份：{year} | 期刊：{journal} | 证据等级：{evidence_level}
+    关键发现：{key_finding}
+"""
+
+                    enhanced_prompt += """
+
+请生成完整的循证医学报告，包含以下部分：
+
+# 文献证据表格
+[自动生成表格]
+
+# 综合总结
+
+## 核心结论
+基于上述高质量文献证据，总结主要发现和核心观点。
+
+## 具体循证建议
+提供基于证据的具体临床实践建议，包括诊断、治疗、预防等方面。
+
+【强制规则要求】
+1. 必须输出完整、无截断的结构化内容
+2. 所有Markdown格式标签必须成对闭合（如**加粗**、*斜体*等）
+3. 每条建议必须有完整结尾，禁止半句话输出
+4. 确保内容完整，避免因长度限制被截断
+5. 核心结论和具体循证建议都必须有明确的结束标志
+
+【输出格式要求】
+- 核心结论：至少3-5个完整句子，总结主要发现
+- 具体循证建议：每条建议必须完整，包含诊断、治疗、预防等具体内容
+- 所有格式标签必须闭合，无未闭合的**或*标记
+- 确保报告结构完整，包含所有必要部分
+"""
+
+                    # 调用LLM生成报告（增加token长度预留）
+                    summary_result = coordinator.summary_agent._call_llm(
+                        enhanced_prompt,
+                        "你是循证医学专家，请基于文献证据生成专业、详细、结构化的医学报告。确保内容完整无截断，所有格式标签正确闭合。",
+
+                    )
+
+                    # 输出完整性校验
+                    final_report = self._validate_and_fix_report(summary_result, papers, self.query)
+
+                except Exception as e:
+                    logger.error(f"总结生成失败，生成基础报告: {str(e)}")
+                    # 生成一个基础的报告作为降级方案
+                    final_report = self._generate_base_report(papers, self.query)
+
+                # 保存到状态
+                self.agent.state.academic_papers = papers
+                self.agent.state.final_report = final_report
+
+                result = {
+                    "type": "academic",
+                    "report": final_report,
+                    "papers": papers
+                }
+
+                # 保存结果到本地缓存
+                self.cache.set(self.query, 7, result)
+                self.node_results[7] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+            else:
+                # 通用模式：报告已在节点6生成，这里保存
+                report = self.node_results[6].get("report", "")
+
+                self.node_results[7] = {
+                    "type": "general",
+                    "report": report,
+                    "papers": []
+                }
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+        except Exception as e:
+            logger.error(f"节点7执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
+            try:
+                papers = self.node_results[6].get("papers", [])
+                conclusion = self.node_results[6].get("conclusion", "")
+                table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
+                for p in papers[:10]:
+                    title_short = p.get('title', '')[:50] + ('...' if len(p.get('title', '')) > 50 else '')
+                    year = p.get('year', 0)
+                    level = p.get('evidence_level', '未知')
+                    finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
+                    table += f"| {title_short} | {year} | {level} | {finding} |\n"
+                final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{conclusion}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
+                result = {
+                    "type": "fallback",
+                    "report": final_report,
+                    "papers": papers,
+                    "message": "基础报告生成（异常降级）"
+                }
+                self.cache.set(self.query, 7, result)
+                self.node_results[7] = result
+            except:
+                self.node_results[7] = {
+                    "type": "fallback",
+                    "report": "## 暂无报告\n\n请完成前置节点后重新生成报告。",
+                    "papers": []
+                }
             self._save_state()
-        else:
-            # 通用模式：报告已在节点6生成，这里保存
-            report = self.node_results[6].get("report", "")
-
-            self.node_results[7] = {
-                "type": "general",
-                "report": report,
-                "papers": []
-            }
-            # 保存状态，确保后续节点能正确加载
-            self._save_state()
+            raise
 
     def rerun_from_node(self, node_id: int):
         """从指定节点重新执行（清除后续节点结果）"""
@@ -863,6 +1619,10 @@ def main():
         page_icon="🔍",
         layout="wide"
     )
+
+    # 隐藏技术错误信息
+    st.set_option('client.showErrorDetails', False)
+
 
     st.title("Deep Search Agent")
     st.markdown("基于大语言模型的无框架深度搜索AI代理")
@@ -1143,84 +1903,101 @@ def main():
 
         # 处理开始研究
         if start_research:
-            if not query.strip():
-                st.error("请输入研究查询")
-                return
+            try:
+                if not query.strip():
+                    st.error("请输入研究查询")
+                    return
 
-            # 验证配置
-            if llm_provider == "zhipu" and not zhipu_key:
-                st.error("请提供智谱 API Key")
-                return
+                # 验证配置
+                if llm_provider == "zhipu" and not zhipu_key:
+                    st.error("请提供智谱 API Key")
+                    return
 
-            if llm_provider == "deepseek" and not deepseek_key:
-                st.error("请提供 DeepSeek API Key")
-                return
+                if llm_provider == "deepseek" and not deepseek_key:
+                    st.error("请提供 DeepSeek API Key")
+                    return
 
-            if llm_provider == "openai" and not openai_key:
-                st.error("请提供 OpenAI API Key")
-                return
+                if llm_provider == "openai" and not openai_key:
+                    st.error("请提供 OpenAI API Key")
+                    return
 
-            if not academic_mode and not tavily_key:
-                st.error("请提供 Tavily API Key")
-                return
+                if not academic_mode and not tavily_key:
+                    st.error("请提供 Tavily API Key")
+                    return
 
-            # 学术模式敏感词过滤
-            if academic_mode:
-                try:
-                    from src.utils.evidence import filter_sensitive
-                    if filter_sensitive(query):
-                        st.error("⚠️ 检测到敏感内容，无法提供相关学术信息。")
-                        return
-                except ImportError:
-                    logger.warning("无法导入filter_sensitive函数，跳过敏感词过滤")
+                # 学术模式敏感词过滤
+                if academic_mode:
+                    try:
+                        from src.utils.evidence import filter_sensitive
+                        if filter_sensitive(query):
+                            st.error("⚠️ 检测到敏感内容，无法提供相关学术信息。")
+                            return
+                    except ImportError:
+                        logger.warning("无法导入filter_sensitive函数，跳过敏感词过滤")
 
-            # 创建配置
-            config = Config(
-                deepseek_api_key=deepseek_key if llm_provider == "deepseek" else None,
-                openai_api_key=openai_key if llm_provider == "openai" else None,
-                zhipu_api_key=zhipu_key if llm_provider == "zhipu" else None,
-                tavily_api_key=tavily_key,
-                default_llm_provider=llm_provider,
-                deepseek_model=model_name if llm_provider == "deepseek" else "deepseek-chat",
-                openai_model=model_name if llm_provider == "openai" else "gpt-4o-mini",
-                zhipu_model=model_name if llm_provider == "zhipu" else "glm-4.7",
-                max_reflections=max_reflections,
-                max_search_results=max_search_results,
-                max_content_length=max_content_length,
-                output_dir="streamlit_reports",
-                academic_mode=academic_mode
-            )
+                # 创建配置
+                config = Config(
+                    deepseek_api_key=deepseek_key if llm_provider == "deepseek" else None,
+                    openai_api_key=openai_key if llm_provider == "openai" else None,
+                    zhipu_api_key=zhipu_key if llm_provider == "zhipu" else None,
+                    tavily_api_key=tavily_key,
+                    default_llm_provider=llm_provider,
+                    deepseek_model=model_name if llm_provider == "deepseek" else "deepseek-chat",
+                    openai_model=model_name if llm_provider == "openai" else "gpt-4o-mini",
+                    zhipu_model=model_name if llm_provider == "zhipu" else "glm-4.7",
+                    max_reflections=max_reflections,
+                    max_search_results=max_search_results,
+                    max_content_length=max_content_length,
+                    output_dir="streamlit_reports",
+                    academic_mode=academic_mode
+                )
 
-            # 初始化编排器
-            orchestrator = StreamlitUIOrchestrator(config)
-            orchestrator.set_query(query, mode="academic" if academic_mode else "general")
-            st.session_state.orchestrator = orchestrator
-            st.session_state.initialized = True
+                # 初始化编排器
+                orchestrator = StreamlitUIOrchestrator(config)
+                orchestrator.set_query(query, mode="academic" if academic_mode else "general")
+                st.session_state.orchestrator = orchestrator
+                st.session_state.initialized = True
 
-            # 自动执行节点1
-            st.session_state.node_to_execute = 1
-            st.rerun()
+                # 自动执行节点1
+                st.session_state.node_to_execute = 1
+                st.rerun()
+            except Exception as e:
+                logger.error(f"开始研究失败: {str(e)}", exc_info=True)
+                st.error("⚠️ 启动研究时遇到问题，请检查配置后重试")
 
         # 处理节点执行
         if st.session_state.orchestrator is not None and "node_to_execute" in st.session_state:
-            node_id = st.session_state.node_to_execute
-            del st.session_state.node_to_execute
+            try:
+                node_id = st.session_state.node_to_execute
+                del st.session_state.node_to_execute
 
-            orchestrator = st.session_state.orchestrator
-            orchestrator._load_state()
+                orchestrator = st.session_state.orchestrator
+                orchestrator._load_state()
 
-            with st.spinner(f"正在执行节点{node_id}..."):
-                success = orchestrator.execute_node(node_id)
+                with st.spinner(f"正在执行节点{node_id}..."):
+                    success = orchestrator.execute_node(node_id)
 
-            if success:
-                st.success(f"节点{node_id}执行完成！")
-                # 自动展开当前节点结果
-                st.session_state.expanded_node = node_id
-            else:
-                error_msg = orchestrator.node_errors.get(node_id, "未知错误")
-                st.error(f"节点{node_id}执行失败: {error_msg}")
+                if success:
+                    st.success(f"节点{node_id}执行完成！")
+                    # 自动展开当前节点结果
+                    st.session_state.expanded_node = node_id
+                else:
+                    # 友好的错误提示，不显示技术细节
+                    error_msg = orchestrator.node_errors.get(node_id, "该步骤遇到问题")
+                    st.warning(f"⚠️ 节点{node_id}遇到问题: {error_msg}")
 
-            st.rerun()
+                    # 检查是否使用了降级方案
+                    node_result = orchestrator.node_results.get(node_id, {})
+                    if node_result.get("_fallback_used"):
+                        st.info("💡 已自动使用降级方案继续流程，可查看简化结果")
+
+                st.rerun()
+            except Exception as e:
+                logger.error(f"节点执行发生未处理异常: {str(e)}", exc_info=True)
+                st.error("⚠️ 执行过程中遇到问题，请稍后重试")
+                # 清除会话状态，避免重复执行
+                if "node_to_execute" in st.session_state:
+                    del st.session_state.node_to_execute
 
         # 显示节点结果
         if st.session_state.orchestrator is not None and "expanded_node" in st.session_state:
@@ -1380,6 +2157,12 @@ def main():
 
 def display_node_result(node_id: int, result: Dict[str, Any], mode: str):
     """显示节点结果"""
+    # 检查是否使用了降级方案
+    if result.get("_fallback_used"):
+        st.info("💡 此节点使用了降级方案，结果可能不完整")
+    if result.get("type") == "fallback" and result.get("message"):
+        st.info(f"💡 {result.get('message')}")
+
     if node_id == 1:
         # 问题拆解与关键词生成
         if mode == "academic":

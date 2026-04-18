@@ -1,6 +1,6 @@
 from .base_agent import BaseAgent
 from src.llms.zhipu import ZhipuLLM
-from src.prompts.academic_prompts import BATCH_EXTRACT_PROMPT, SUMMARIZE_PROMPT
+from src.prompts.academic_prompts import BATCH_EXTRACT_PROMPT
 import re
 import json
 import time
@@ -91,24 +91,94 @@ class SummaryAgent(BaseAgent):
             table += f"| {title_short} | {year} | {level} | {finding} |\n"
         return table
 
-    def _generate_summary(self, query: str, table: str) -> str:
-        """生成综合回答"""
-        summarize_prompt = SUMMARIZE_PROMPT.format(question=query, evidence_table=table)
-        summary = self._call_llm(summarize_prompt)
-        
+    def _generate_summary(self, query: str, papers: list) -> str:
+        """生成综合回答 - 锁死量化强制规则"""
+        print(f"\n{'='*60}")
+        print(f"【节点6：开始生成总结】用户问题：{query}")
+        print(f"【节点6：文献数量】{len(papers)}篇")
+
+        # 构建完整的文献列表，包含标题、摘要、GRADE分级、发布年份
+        papers_list = []
+        for i, p in enumerate(papers, 1):
+            paper_info = f"【文献{i}】\n"
+            paper_info += f"标题：{p.get('title', 'N/A')}\n"
+            paper_info += f"GRADE分级：{p.get('evidence_level', 'N/A')}\n"
+            paper_info += f"发布年份：{p.get('year', 'N/A')}\n"
+            paper_info += f"摘要：{p.get('abstract', 'N/A')}"
+            papers_list.append(paper_info)
+
+        papers_text = "\n\n===\n\n".join(papers_list)
+        print(f"【节点6：文献数据完整性】摘要总字符数：{sum(len(p.get('abstract', '')) for p in papers)}")
+
+        # 锁死的量化强制system prompt
+        system_prompt = """你是严格的循证医学证据分析专家。输出必须严格遵守以下铁律：
+
+【铁律1：量化强制 - 绝对禁止违反】
+每条结论必须包含具体数值，格式如：
+- "150-200分钟/周"
+- "30-40kcal/kg/天"
+- "<2g/日"
+- "收缩压<140mmHg"
+- "每周3-5次"
+
+严禁使用的模糊词（发现即判定为违规）：
+- 适量、适当、一定量、足够、充分
+- 建议咨询医生、具体需因人而异、个体化决策
+- 标准化流程、综合措施、参考高质量文献
+
+如文献未提供具体数值，必须明确写："文献未提供具体数值"
+
+【铁律2：来源强制 - 绝对禁止违反】
+每句话结尾必须标注：[来源：标题 年份 GRADE X]
+示例：
+"每周运动150-250分钟可降低心血管风险 [来源：运动与健康指南 2022 GRADE A]"
+
+禁止无来源的结论。
+
+【铁律3：内容强制 - 绝对禁止违反】
+- 只回答用户问题，不展开任何无关话题
+- 禁止任何形式的通用免责话术
+- 如文献证据不足，必须写："现有文献未提供充分量化证据"
+
+【输出格式】
+直接输出结论，使用列表形式：
+• 结论1 [来源：文献标题 年份 GRADE X]
+• 结论2 [来源：文献标题 年份 GRADE X]"""
+
+        user_prompt = f"""【用户问题】
+{query}
+
+【可用文献证据】（共{len(papers)}篇）
+{papers_text}
+
+请严格遵循上述铁律，基于文献证据生成量化结论："""
+
+        # 打印传入LLM的完整prompt（调试用）
+        print(f"\n{'='*60}")
+        print("【节点6：传入LLM的完整System Prompt】")
+        print(system_prompt)
+        print(f"\n{'='*60}")
+        print("【节点6：传入LLM的完整User Prompt】")
+        print(user_prompt[:500] + "..." if len(user_prompt) > 500 else user_prompt)
+        print(f"{'='*60}\n")
+
+        summary = self._call_llm(user_prompt, system_prompt)
+
         # 调试信息：检查总结内容
+        print(f"【节点6：LLM响应长度】{len(summary)}字符")
+        print(f"【节点6：LLM响应内容】{summary[:200]}..." if len(summary) > 200 else summary)
+
+        # 检测是否包含被禁止的模糊词
+        forbidden_words = ['适量', '适当', '一定量', '建议咨询医生', '因人而异', '标准化流程', '综合措施', '参考高质量文献']
+        found_forbidden = [word for word in forbidden_words if word in summary]
+        if found_forbidden:
+            print(f"⚠️ 警告：总结包含被禁止的模糊词：{found_forbidden}")
+
         if not summary or len(summary.strip()) < 50:
-            print(f"警告：总结内容过短或为空，长度: {len(summary)}")
-            # 生成一个兜底的总结
-            summary = """## 核心结论
-基于现有文献证据，建议咨询专业医生获取个性化诊疗方案。
+            print(f"❌ 错误：总结内容过短或为空，长度: {len(summary)}")
+            summary = f"⚠️ 现有文献（共{len(papers)}篇）未能提供回答该问题的具体量化证据。建议扩大检索范围或调整问题表述。"
 
-## 具体循证建议
-请结合临床实际情况制定个体化治疗方案。
-
-## 证据来源
-详见上方文献表格。"""
-        
+        print(f"{'='*60}\n")
         return summary
 
     def process(self, input_data: dict) -> dict:
@@ -124,8 +194,8 @@ class SummaryAgent(BaseAgent):
         # 生成表格
         table = self._generate_table(papers_with_findings)
 
-        # 生成总结
-        summary = self._generate_summary(query, table)
+        # 生成总结 - 传入完整的papers信息
+        summary = self._generate_summary(query, papers_with_findings)
 
         disclaimer = "\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
         final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{summary}{disclaimer}"

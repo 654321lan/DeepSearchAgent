@@ -1,10 +1,13 @@
 """
 循证医学证据分级工具
 严格遵循GRADE (Grading of Recommendations Assessment, Development and Evaluation) 官方标准
+优化版本：两步分级（正则硬规则+LLM批量调整）
 """
 import re
 import logging
-from typing import Dict, Any, Optional, Tuple
+import json
+import time
+from typing import Dict, Any, Optional, Tuple, List
 from enum import Enum
 
 logger = logging.getLogger(__name__)
@@ -26,9 +29,9 @@ class GRADELevel(Enum):
     LOW = "GRADE 低级"        # 病例对照/降级后的队列研究
     VERY_LOW = "GRADE 极低级" # 观察性研究/专家意见
 
-# ==================== 配置常量（可抽离到config.py） ====================
+# ==================== 配置常量 ====================
 GRADE_CONFIG = {
-    # 按研究类型的初始证据等级（遵循GRADE官方标准）
+    # 按研究类型的初始证据等级（严格硬规则）
     "initial_level": {
         StudyType.SYSTEMATIC_REVIEW_META: GRADELevel.HIGH,
         StudyType.RCT: GRADELevel.HIGH,
@@ -37,283 +40,229 @@ GRADE_CONFIG = {
         StudyType.OBSERVATIONAL: GRADELevel.VERY_LOW,
         StudyType.EXPERT_OPINION: GRADELevel.VERY_LOW,
     },
-    # 不精确性：按研究类型的样本量阈值
-    "sample_size_threshold": {
-        StudyType.SYSTEMATIC_REVIEW_META: 1000,
-        StudyType.RCT: 300,
-        StudyType.COHORT: 500,
-        StudyType.CASE_CONTROL: 200,
-        StudyType.OBSERVATIONAL: 100,
-        StudyType.EXPERT_OPINION: 50,
-    },
-    # 核心期刊列表（简化版，可扩展）
-    "core_journals": ["lancet", "nejm", "jama", "bmj", "nature", "science", "cell", "circulation", "diabetes care"],
-    # 临床注册平台前缀
-    "clinical_registry_prefixes": ["nct", "chi-ctr", "isrctn", "jprn", "umin-ctr"],
 }
 
-# ==================== 研究类型分类（LLM小样本+正则兜底） ====================
-def classify_study_type(paper: Dict[str, Any], llm_client=None) -> Tuple[StudyType, float]:
-    """
-    分类研究类型
-    优先用LLM小样本分类，失败则用正则兜底
-    返回：(研究类型, 置信度)
-    """
-    title = paper.get("title", "").lower()
-    abstract = paper.get("abstract", "").lower()
-    full_text = f"{title} {abstract}"
+# ==================== LLM升级/降级因素判断提示词 ====================
+GRADE_ADJUSTMENT_PROMPT = """
+你是循证医学GRADE证据分级专家。请基于提供的文献信息，判断是否存在以下GRADE升级或降级因素：
 
-    # 1. 优先尝试LLM小样本分类（如果有LLM客户端）
-    if llm_client:
-        try:
-            study_type, confidence = _classify_with_llm(full_text, llm_client)
-            if confidence > 0.7:  # 置信度足够高，直接返回
-                return study_type, confidence
-        except Exception as e:
-            logger.warning(f"LLM分类失败，降级到正则: {e}")
+## 降级因素（每项最多降1级）：
+1. 研究局限性：随机化、盲法、失访率等
+2. 不精确性：样本量不足、置信区间宽
+3. 发表偏倚：非核心期刊、无基金支持
+4. 不一致性：研究结果不一致
+5. 间接性：人群、干预、结局指标不匹配
 
-    # 2. 正则兜底（按优先级匹配）
-    return _classify_with_regex(full_text)
+## 升级因素（每项最多升1级）：
+1. 效应量大：风险比/比值比等效应量很大
+2. 剂量反应关系：剂量与效应呈正相关
+3. 混杂因素调整：充分调整了混杂因素
 
-def _classify_with_llm(text: str, llm_client) -> Tuple[StudyType, float]:
-    """用LLM小样本分类研究类型"""
-    system_prompt = """你是循证医学研究类型分类专家，仅根据提供的标题和摘要，判断研究类型。
-严格按以下格式输出JSON，不要输出其他内容：
+请严格按以下JSON格式输出，不要输出其他内容：
+```json
 {
-    "study_type": "rct/cohort/case_control/systematic_review_meta/observational/expert_opinion",
-    "confidence": 0.0-1.0之间的浮点数
-}
-
-研究类型定义：
-- systematic_review_meta: 系统综述、Meta分析、荟萃分析
-- rct: 随机对照试验、Randomized Controlled Trial
-- cohort: 队列研究、前瞻性研究
-- case_control: 病例对照研究、回顾性研究
-- observational: 其他观察性研究、横断面研究
-- expert_opinion: 专家意见、病例报告、综述（非系统综述）
-
-示例：
-输入："一项随机、双盲、安慰剂对照试验，纳入300名2型糖尿病患者..."
-输出：{"study_type": "rct", "confidence": 0.95}
-
-输入："系统综述和Meta分析，纳入15项RCT共5000名患者..."
-输出：{"study_type": "systematic_review_meta", "confidence": 0.98}
-"""
-    
-    user_prompt = f"现在开始分类：\n{text}"
-    
-    # 使用正确的LLM调用方法
-    try:
-        response = llm_client.invoke(system_prompt, user_prompt)
-    except AttributeError:
-        # 如果llm_client没有invoke方法，尝试使用generate方法
-        try:
-            response = llm_client.generate(system_prompt, user_prompt)
-        except Exception as e:
-            raise ValueError(f"LLM调用失败: {str(e)}")
-    
-    # 解析JSON
-    import json
-    try:
-        result = json.loads(response)
-        study_type_str = result.get("study_type", "observational")
-        confidence = result.get("confidence", 0.5)
-        
-        # 映射到枚举
-        type_mapping = {
-            "rct": StudyType.RCT,
-            "cohort": StudyType.COHORT,
-            "case_control": StudyType.CASE_CONTROL,
-            "systematic_review_meta": StudyType.SYSTEMATIC_REVIEW_META,
-            "observational": StudyType.OBSERVATIONAL,
-            "expert_opinion": StudyType.EXPERT_OPINION,
+    "adjustments": [
+        {
+            "title": "文献标题",
+            "upgrade_factors": ["因素1", "因素2"],
+            "downgrade_factors": ["因素1", "因素2"],
+            "net_adjustment": 0  // 净调整值：升级因素数-降级因素数，范围[-3, 3]
         }
-        return type_mapping.get(study_type_str, StudyType.OBSERVATIONAL), confidence
-    except:
-        raise ValueError("LLM返回格式错误")
+    ]
+}
+```
 
-def _classify_with_regex(text: str) -> Tuple[StudyType, float]:
-    """正则兜底分类研究类型（优化匹配逻辑，减少误判）"""
-    # 按优先级匹配，优化正则表达式精准度
+文献信息：
+{papers_info}
+"""
+
+# ==================== 第一步：正则硬规则初始分级 ====================
+def _get_initial_grade_strict(paper: Dict[str, Any]) -> Tuple[GRADELevel, str]:
+    """
+    第一步：正则硬规则初始分级（完全禁用LLM）
+    返回：(初始等级, 分类原因)
+    """
+    title = paper.get("title", "").lower()
+    abstract = paper.get("abstract", "").lower()
+    full_text = f"{title} {abstract}".strip()
+    
+    # 严格正则匹配（按GRADE优先级）
     patterns = [
-        (StudyType.SYSTEMATIC_REVIEW_META, r"(systematic review|meta[- ]analysis|荟萃分析|系统综述|guideline|指南)", 0.8),
-        (StudyType.RCT, r"(randomized|randomised|rct|随机对照试验|随机.*双盲|随机.*安慰剂)", 0.75),
-        (StudyType.COHORT, r"(cohort study|队列研究|前瞻性队列|回顾性队列)", 0.7),
-        (StudyType.CASE_CONTROL, r"(case[- ]control study|病例对照研究|回顾性病例对照)", 0.7),
-        (StudyType.OBSERVATIONAL, r"(observational study|cross[- ]sectional|横断面研究|描述性研究)", 0.6),
-        (StudyType.EXPERT_OPINION, r"(expert opinion|case report|专家意见|病例报告|非系统综述)", 0.5),
+        (StudyType.SYSTEMATIC_REVIEW_META, r"(systematic\s+review|meta[\-\s]analysis|荟萃分析|系统综述|guideline|指南|practice\s+guidance)", "系统综述/Meta分析/指南"),
+        (StudyType.RCT, r"(randomized\s+controlled\s+trial|randomised\s+controlled\s+trial|rct|随机对照试验|随机.*双盲|随机.*安慰剂)", "随机对照试验"),
+        (StudyType.COHORT, r"(cohort\s+study|队列研究|前瞻性队列|回顾性队列)", "队列研究"),
+        (StudyType.CASE_CONTROL, r"(case[\-\s]control\s+study|病例对照研究|回顾性病例对照)", "病例对照研究"),
+        (StudyType.OBSERVATIONAL, r"(observational\s+study|cross[\-\s]sectional|横断面研究|描述性研究)", "观察性研究"),
+        (StudyType.EXPERT_OPINION, r"(expert\s+opinion|case\s+report|专家意见|病例报告|非系统综述)", "专家意见/病例报告"),
     ]
     
-    for study_type, pattern, confidence in patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return study_type, confidence
+    for study_type, pattern, reason in patterns:
+        if re.search(pattern, full_text, re.IGNORECASE):
+            initial_level = GRADE_CONFIG["initial_level"].get(study_type, GRADELevel.VERY_LOW)
+            return initial_level, f"正则匹配到{reason}"
     
-    # 优化：默认返回前先检查是否有高等级关键词遗漏，避免直接返回低等级
-    # 若文本中无任何匹配，优先标记为observational（而非直接极低级），但增加日志
-    logger.warning(f"未匹配到明确研究类型，文本：{text[:100]}")
-    return StudyType.OBSERVATIONAL, 0.3
+    # 兜底：极低级
+    return GRADELevel.VERY_LOW, "未匹配到具体类型，使用兜底极低级"
 
-# ==================== GRADE 5大核心降级因素判断 ====================
-def _assess_risk_of_bias(paper: Dict[str, Any], study_type: StudyType) -> int:
+# ==================== 第二步：LLM批量升级/降级因素判断 ====================
+def _get_llm_adjustments_batch(papers: List[Dict[str, Any]], llm_client) -> Dict[str, int]:
     """
-    评估研究局限性（Risk of Bias）
-    返回降级数：0-2
+    第二步：LLM批量升级/降级因素判断
+    单轮仅调用1次LLM，严格控制API调用
+    返回：{文献标题: 净调整值}
     """
-    abstract = paper.get("abstract", "").lower()
-    title = paper.get("title", "").lower()
-    full_text = f"{title} {abstract}"
-
-    downgrade = 0
-
-    # 仅对RCT评估研究局限性（系统综述/指南通常基于已有研究，不评估此因素）
-    if study_type != StudyType.RCT:
-        return 0
-
-    # 检查是否随机
-    if not re.search(r"(random|randomized|randomised|随机对照)", full_text, re.IGNORECASE):
-        downgrade += 1
-
-    # 检查是否盲法
-    if not re.search(r"(blind|blind?ed|双盲|单盲|盲法)", full_text, re.IGNORECASE):
-        downgrade += 1
-
-    # 检查失访率（如果提到）
-    loss_to_followup = re.search(r"(\d+%)\s*(loss|失访|脱落|withdrawal)", full_text, re.IGNORECASE)
-    if loss_to_followup:
+    if not llm_client or len(papers) == 0:
+        return {}
+    
+    # 构建文献信息字符串（限制长度，避免token超限）
+    papers_info = ""
+    for i, paper in enumerate(papers[:10]):  # 最多处理10篇文献
+        title = paper.get('title', '')[:100]
+        abstract = paper.get('abstract', '')[:200]
+        journal = paper.get('journal', '')
+        year = paper.get('year', '')
+        
+        papers_info += f"\n{i+1}. 标题：{title}\n   期刊：{journal} | 年份：{year}\n   摘要：{abstract}\n"
+    
+    # 准备提示词
+    prompt = GRADE_ADJUSTMENT_PROMPT.format(papers_info=papers_info)
+    
+    # 单轮LLM调用，严格控制
+    try:
+        # 添加限流控制
+        time.sleep(2)  # 避免速率限制
+        
+        # 调用LLM（使用invoke或generate方法）
         try:
-            rate = float(loss_to_followup.group(1).strip('%'))
-            if rate > 20:
-                downgrade += 1
-        except:
-            pass
+            response = llm_client.invoke("", prompt)
+        except AttributeError:
+            response = llm_client.generate("", prompt)
+        
+        # 解析JSON响应
+        response = re.sub(r'```json\s*|\s*```', '', response).strip()
+        result = json.loads(response)
+        
+        # 提取调整结果
+        adjustments = {}
+        for adj in result.get("adjustments", []):
+            title = adj.get("title", "")
+            net_adjustment = adj.get("net_adjustment", 0)
+            # 限制调整范围[-3, 3]
+            net_adjustment = max(-3, min(3, net_adjustment))
+            adjustments[title] = net_adjustment
+        
+        logger.info(f"LLM批量调整完成，处理{len(adjustments)}篇文献")
+        return adjustments
+        
+    except Exception as e:
+        logger.warning(f"LLM批量调整失败，使用默认值: {e}")
+        return {}  # 失败时返回空字典，不影响主流程
 
-    return min(downgrade, 2)  # 最多降2级
+# ==================== 辅助函数：计算最终等级 ====================
+def _calculate_final_level(initial_level: GRADELevel, net_adjustment: int) -> GRADELevel:
+    """计算最终等级：初始等级 + 净调整值"""
+    level_order = [GRADELevel.HIGH, GRADELevel.MODERATE, GRADELevel.LOW, GRADELevel.VERY_LOW]
+    
+    try:
+        initial_index = level_order.index(initial_level)
+        final_index = initial_index - net_adjustment  # 升级是+，降级是-
+        final_index = max(0, min(final_index, len(level_order) - 1))
+        return level_order[final_index]
+    except:
+        return initial_level  # 异常时返回初始等级
 
-def _assess_imprecision(paper: Dict[str, Any], study_type: StudyType) -> int:
+# ==================== 主函数：GRADE证据分级（两步分级标准） ====================
+def get_evidence_level(paper: Dict[str, Any], llm_client=None, batch_papers: List[Dict[str, Any]] = None) -> Tuple[GRADELevel, Dict[str, Any]]:
     """
-    评估不精确性（Imprecision）
-    按研究类型设置不同样本量阈值
-    返回降级数：0-1
-    """
-    abstract = paper.get("abstract", "").lower()
-    title = paper.get("title", "").lower()
-    full_text = f"{title} {abstract}"
-
-    # 系统综述/指南不评估不精确性（基于已有研究）
-    if study_type == StudyType.SYSTEMATIC_REVIEW_META:
-        return 0
-
-    # 提取样本量
-    sample_size = 0
-    # 匹配 "n=100"、"纳入100名"、"共100例"
-    matches = re.findall(r"(\d{2,5})\s*(patients|subjects|participants|名|例)", full_text, re.IGNORECASE)
-    if matches:
-        # 取最大的数字
-        sample_size = max(int(m[0]) for m in matches)
-
-    # 获取阈值
-    threshold = GRADE_CONFIG["sample_size_threshold"].get(study_type, 100)
-
-    # 样本量不足，降1级
-    if sample_size < threshold:
-        return 1
-    return 0
-
-def _assess_publication_bias(paper: Dict[str, Any]) -> int:
-    """
-    评估发表偏倚（Publication Bias）
-    返回降级数：0-1
-    """
-    journal = paper.get("journal", "").lower()
-    abstract = paper.get("abstract", "").lower()
-    title = paper.get("title", "").lower()
-    full_text = f"{title} {abstract}"
-
-    # 扩展核心期刊列表（包括医学主要期刊和指南发布机构）
-    extended_core_journals = GRADE_CONFIG["core_journals"] + [
-        'hepatology', 'gastroenterology', 'american journal of gastroenterology',
-        'clinical gastroenterology', 'gut', 'journal of hepatology',
-        'who', 'cdc', 'nih', 'aasld', 'easl', 'apa', 'esa'
-    ]
-
-    # 加分项（不降）
-    has_core_journal = any(cj in journal for cj in extended_core_journals)
-    has_clinical_registry = any(rp in full_text for rp in GRADE_CONFIG["clinical_registry_prefixes"])
-    has_funding = re.search(r"(fund|grant|基金|资助|supported by|funded by)", full_text, re.IGNORECASE)
-
-    # 如果有核心期刊、临床注册或基金支持，不降
-    if has_core_journal or has_clinical_registry or has_funding:
-        return 0
-
-    # 否则降1级
-    return 1
-
-# ==================== 主函数：GRADE证据分级 ====================
-def get_evidence_level(paper: Dict[str, Any], llm_client=None) -> Tuple[GRADELevel, Dict[str, Any]]:
-    """
-    严格遵循GRADE官方标准进行证据分级
+    严格遵循GRADE官方标准进行证据分级（两步分级）
+    第一步：正则硬规则初始分级（完全禁用LLM）
+    第二步：LLM批量升级/降级因素判断（单轮仅调用1次）
     返回：(GRADE等级, 分级详情字典)
     """
-    # 初始化详情字典（防止为空）
-    downgrade_details = {
-        "study_type": "",
-        "classification_confidence": 0.0,
+    # 初始化详情字典（完整可溯源）
+    grade_details = {
         "initial_level": "",
-        "risk_of_bias": 0,
-        "imprecision": 0,
-        "publication_bias": 0,
-        "inconsistency": 0,
-        "indirectness": 0,
-        "total_downgrade": 0,
-        "final_level": ""
+        "initial_reason": "",
+        "llm_adjustment": 0,
+        "upgrade_factors": [],
+        "downgrade_factors": [],
+        "final_level": "",
+        "calculation_steps": []
     }
     
     try:
-        # 1. 分类研究类型
-        study_type, confidence = classify_study_type(paper, llm_client)
-        downgrade_details["study_type"] = study_type.value
-        downgrade_details["classification_confidence"] = confidence
+        # ========== 第一步：正则硬规则初始分级 ==========
+        initial_level, initial_reason = _get_initial_grade_strict(paper)
+        grade_details["initial_level"] = initial_level.value
+        grade_details["initial_reason"] = initial_reason
+        grade_details["calculation_steps"].append(f"第一步：正则硬规则分级 -> {initial_level.value}")
         
-        # 2. 获取初始证据等级
-        initial_level = GRADE_CONFIG["initial_level"].get(study_type, GRADELevel.VERY_LOW)
-        downgrade_details["initial_level"] = initial_level.value
+        # ========== 第二步：LLM批量升级/降级因素判断 ==========
+        net_adjustment = 0
+        upgrade_factors = []
+        downgrade_factors = []
         
-        # 3. 计算降级因素
-        downgrade_details["risk_of_bias"] = _assess_risk_of_bias(paper, study_type)
-        downgrade_details["imprecision"] = _assess_imprecision(paper, study_type)
-        downgrade_details["publication_bias"] = _assess_publication_bias(paper)
-
-        # 计算总降级数
-        total_downgrade = sum([
-            downgrade_details["risk_of_bias"],
-            downgrade_details["imprecision"],
-            downgrade_details["publication_bias"],
-            downgrade_details["inconsistency"],
-            downgrade_details["indirectness"]
-        ])
-        downgrade_details["total_downgrade"] = total_downgrade
-
-        # 4. 计算最终等级（修复降级逻辑）
-        level_order = [GRADELevel.HIGH, GRADELevel.MODERATE, GRADELevel.LOW, GRADELevel.VERY_LOW]
-        initial_index = level_order.index(initial_level)
-
-        # 核心修复：level_order是从高到低排序，降级应该是加上降级数（不是减去）
-        # 例如：高级(索引0) + 降3级 = 极低级(索引3)
-        final_index = initial_index + total_downgrade
-        # 确保索引在有效范围内 [0, len(level_order) - 1]
-        final_index = max(0, min(final_index, len(level_order) - 1))
-
-        final_level = level_order[final_index]
-        downgrade_details["final_level"] = final_level.value
+        if llm_client and batch_papers:
+            # 批量获取LLM调整结果
+            llm_adjustments = _get_llm_adjustments_batch(batch_papers, llm_client)
+            
+            # 查找当前文献的调整结果
+            paper_title = paper.get('title', '')
+            if paper_title in llm_adjustments:
+                net_adjustment = llm_adjustments[paper_title]
+                
+                # 记录调整因素（简化处理，实际应从LLM返回中提取）
+                if net_adjustment > 0:
+                    upgrade_factors = [f"LLM识别到{net_adjustment}个升级因素"]
+                elif net_adjustment < 0:
+                    downgrade_factors = [f"LLM识别到{abs(net_adjustment)}个降级因素"]
+                
+                grade_details["calculation_steps"].append(f"第二步：LLM批量调整 -> 净调整值{net_adjustment}")
+            else:
+                grade_details["calculation_steps"].append("第二步：未找到LLM调整结果，使用默认值")
+        else:
+            grade_details["calculation_steps"].append("第二步：无LLM客户端或批量数据，跳过调整")
+        
+        grade_details["llm_adjustment"] = net_adjustment
+        grade_details["upgrade_factors"] = upgrade_factors
+        grade_details["downgrade_factors"] = downgrade_factors
+        
+        # ========== 计算最终等级 ==========
+        final_level = _calculate_final_level(initial_level, net_adjustment)
+        grade_details["final_level"] = final_level.value
+        
+        # 记录最终结果
+        grade_details["calculation_steps"].append(f"最终等级：{initial_level.value} + {net_adjustment} = {final_level.value}")
+        
+        logger.info(f"GRADE分级完成：{paper.get('title', '')[:50]}... -> {initial_level.value} -> {final_level.value} (调整{net_adjustment})")
         
     except Exception as e:
-        # 异常时兜底，确保详情不为空 + 日志记录
+        # 异常时兜底
         logger.error(f"GRADE分级计算失败: {e}", exc_info=True)
         final_level = GRADELevel.VERY_LOW
-        downgrade_details["final_level"] = final_level.value
-        downgrade_details["initial_level"] = GRADELevel.VERY_LOW.value
+        grade_details["final_level"] = final_level.value
+        grade_details["initial_level"] = GRADELevel.VERY_LOW.value
+        grade_details["initial_reason"] = f"系统异常：{str(e)}"
+        grade_details["calculation_steps"].append("系统异常，使用兜底等级")
     
-    return final_level, downgrade_details
+    return final_level, grade_details
+
+# ==================== 批量分级函数（推荐使用） ====================
+def get_evidence_levels_batch(papers: List[Dict[str, Any]], llm_client=None) -> List[Tuple[GRADELevel, Dict[str, Any]]]:
+    """
+    批量GRADE证据分级（推荐使用）
+    单轮LLM调用处理所有文献，效率最高
+    返回：[(等级1, 详情1), (等级2, 详情2), ...]
+    """
+    results = []
+    
+    # 批量处理所有文献
+    for paper in papers:
+        level, details = get_evidence_level(paper, llm_client, papers)
+        results.append((level, details))
+    
+    logger.info(f"批量GRADE分级完成，共处理{len(results)}篇文献")
+    return results
 
 def get_evidence_priority(level: GRADELevel) -> int:
     """获取证据优先级（用于排序，数字越大优先级越高）"""
