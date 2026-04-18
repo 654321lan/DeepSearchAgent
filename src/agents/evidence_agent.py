@@ -43,7 +43,7 @@ class EvidenceAgent(BaseAgent):
         for p in papers:
             try:
                 # 修复：get_evidence_level 返回元组 (level, details)，需要解构
-                level, details = get_evidence_level(p, self.llm)
+                level, details = get_evidence_level(p)
                 p['evidence_level'] = level.value  # 存储字符串值
                 # 只在details不为空时更新grade_details
                 if details and details.get('study_type'):

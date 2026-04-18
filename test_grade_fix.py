@@ -26,11 +26,14 @@ def test_grade_fix():
     
     level, details = get_evidence_level(guideline_paper)
     print(f"证据等级: {level.value}")
-    print(f"研究类型: {details['study_type']}")
+    # 新的数据结构中，study_type在decision_card中
+    study_type = details.get('decision_card', {}).get('initial_study_type', '未知')
+    print(f"研究类型: {study_type}")
     print(f"初始等级: {details['initial_level']}")
     print(f"最终等级: {details['final_level']}")
-    print(f"分类原因: {details['classification_reason']}")
-    print(f"降级原因: {details['downgrade_reasons']}")
+    print(f"分类原因: {details['initial_reason']}")
+    print(f"升级因素: {len(details['upgrade_factors'])}个")
+    print(f"降级因素: {len(details['downgrade_factors'])}个")
     
     # 测试案例2：RCT文献（应该标为高级）
     rct_paper = {
@@ -45,7 +48,8 @@ def test_grade_fix():
     
     level, details = get_evidence_level(rct_paper)
     print(f"证据等级: {level.value}")
-    print(f"研究类型: {details['study_type']}")
+    study_type = details.get('decision_card', {}).get('initial_study_type', '未知')
+    print(f"研究类型: {study_type}")
     print(f"初始等级: {details['initial_level']}")
     
     # 测试案例3：队列研究（应该标为中级）
@@ -61,7 +65,8 @@ def test_grade_fix():
     
     level, details = get_evidence_level(cohort_paper)
     print(f"证据等级: {level.value}")
-    print(f"研究类型: {details['study_type']}")
+    study_type = details.get('decision_card', {}).get('initial_study_type', '未知')
+    print(f"研究类型: {study_type}")
     print(f"初始等级: {details['initial_level']}")
     
     # 测试案例4：病例对照研究（应该标为低级）
@@ -77,7 +82,8 @@ def test_grade_fix():
     
     level, details = get_evidence_level(case_control_paper)
     print(f"证据等级: {level.value}")
-    print(f"研究类型: {details['study_type']}")
+    study_type = details.get('decision_card', {}).get('initial_study_type', '未知')
+    print(f"研究类型: {study_type}")
     print(f"初始等级: {details['initial_level']}")
     
     # 测试案例5：观察性研究（应该标为极低级）
@@ -93,7 +99,8 @@ def test_grade_fix():
     
     level, details = get_evidence_level(observational_paper)
     print(f"证据等级: {level.value}")
-    print(f"研究类型: {details['study_type']}")
+    study_type = details.get('decision_card', {}).get('initial_study_type', '未知')
+    print(f"研究类型: {study_type}")
     print(f"初始等级: {details['initial_level']}")
     
     # 测试案例6：无摘要文献（仅用标题）
@@ -110,9 +117,10 @@ def test_grade_fix():
     
     level, details = get_evidence_level(no_abstract_paper)
     print(f"证据等级: {level.value}")
-    print(f"研究类型: {details['study_type']}")
+    study_type = details.get('decision_card', {}).get('initial_study_type', '未知')
+    print(f"研究类型: {study_type}")
     print(f"初始等级: {details['initial_level']}")
-    print(f"分类原因: {details['classification_reason']}")
+    print(f"分类原因: {details['initial_reason']}")
     
     print("\n=== 测试完成 ===")
 

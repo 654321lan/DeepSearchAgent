@@ -223,7 +223,7 @@ class AcademicCoordinator:
             # 5. 证据分析 - 添加证据等级标注
             for paper in unique_papers:
                 # 添加证据等级（解构元组）
-                level, details = get_evidence_level(paper, self.llm)
+                level, details = get_evidence_level(paper)
                 paper['evidence_level'] = level.value  # 存储字符串
                 paper['grade_details'] = details
                 # 添加证据片段（从论文标题和摘要中提取）
