@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any, List, Callable
 logger = logging.getLogger(__name__)
 
 from .llms import DeepSeekLLM, OpenAILLM, ZhipuLLM, BaseLLM
+from .utils.llm_wrapper import create_tracked_llm
 from .nodes import (
     ReportStructureNode,
     FirstSearchNode,
@@ -26,7 +27,7 @@ from .nodes import (
 from .state.state import State
 from .tools import tavily_search
 from .utils import Config, load_config, format_search_results_for_prompt
-
+from .utils.cost_tracker import get_formatted_cost_summary
 
 class DeepSearchAgent:
     """Deep Search Agent主类"""
@@ -315,23 +316,27 @@ class DeepSearchAgent:
     
     def _initialize_llm(self) -> BaseLLM:
         """初始化LLM客户端"""
+        # 创建原始的 LLM 客户端
         if self.config.default_llm_provider == "deepseek":
-            return DeepSeekLLM(
+            llm = DeepSeekLLM(
                 api_key=self.config.deepseek_api_key,
                 model_name=self.config.deepseek_model
             )
         elif self.config.default_llm_provider == "openai":
-            return OpenAILLM(
+            llm = OpenAILLM(
                 api_key=self.config.openai_api_key,
                 model_name=self.config.openai_model
             )
         elif self.config.default_llm_provider == "zhipu":
-            return ZhipuLLM(
+            llm = ZhipuLLM(
                 api_key=self.config.zhipu_api_key,
                 model_name=self.config.zhipu_model
             )
         else:
             raise ValueError(f"不支持的LLM提供商: {self.config.default_llm_provider}")
+
+        # 包装 LLM 客户端，添加 Token 追踪功能
+        return create_tracked_llm(llm)
     
     def _initialize_nodes(self):
         """初始化处理节点"""
@@ -488,6 +493,12 @@ class DeepSearchAgent:
             # 将论文列表存入状态，保证状态持久化
             self.state.academic_papers = papers
             logger.info(f"学术论文列表已保存到状态: {len(papers) if papers else 0} 篇")
+            # 打印成本统计
+            cost_info = self.get_llm_cost_info()
+            if cost_info:
+                print(f"\n💡 本查询消耗了 ¥{cost_info['total_cost']:.4f} 的 API 调用费用")
+                print(f"Token 消耗：提示 {cost_info['total_tokens']['prompt_tokens']} + 补全 {cost_info['total_tokens']['completion_tokens']} = 总计 {cost_info['total_tokens']['total_tokens']}")
+
             # 调用回调（如果提供）
             if callback:
                 callback(progress=0, message="学术模式研究完成", total_steps=1)
@@ -539,6 +550,12 @@ class DeepSearchAgent:
             # 调用回调（如果提供）
             if callback:
                 callback(progress=95, message="保存报告完成", total_steps=4)
+
+            # 打印成本统计
+            cost_info = self.get_llm_cost_info()
+            if cost_info:
+                print(f"\n💡 本查询消耗了 ¥{cost_info['total_cost']:.4f} 的 API 调用费用")
+                print(f"Token 消耗：提示 {cost_info['total_tokens']['prompt_tokens']} + 补全 {cost_info['total_tokens']['completion_tokens']} = 总计 {cost_info['total_tokens']['total_tokens']}")
 
             print(f"\n{'='*60}")
             print("深度研究完成！")
@@ -1045,17 +1062,73 @@ class DeepSearchAgent:
             print(f"结果整合失败: {str(e)}")
             return default_report
 
-    
+    def get_llm_cost_summary(self):
+        """获取 LLM 调用的成本统计"""
+        if hasattr(self.llm_client, 'get_total_tokens'):
+            return self.llm_client.get_total_tokens()
+        return None
 
-def create_agent(config_file: Optional[str] = None) -> DeepSearchAgent:
+    def get_llm_total_cost(self):
+        """获取 LLM 调用的总成本"""
+        if hasattr(self.llm_client, 'get_total_cost'):
+            return self.llm_client.get_total_cost()
+        return 0.0
+
+    def reset_llm_cost_tracking(self):
+        """重置 LLM 成本追踪"""
+        if hasattr(self.llm_client, 'reset_tracking'):
+            self.llm_client.reset_tracking()
+
+    def get_formatted_cost_summary(self):
+        """获取格式化的成本统计报告"""
+        if hasattr(self.llm_client, 'get_formatted_summary'):
+            return self.llm_client.get_formatted_summary()
+        return "成本追踪未启用"
+
+    def get_llm_cost_info(self):
+        """获取 LLM 成本信息"""
+        try:
+            # 尝试使用包装器的统计方法
+            if hasattr(self.llm_client, 'get_total_tokens'):
+                tokens = self.llm_client.get_total_tokens()
+                cost = self.llm_client.get_total_cost()
+                return {
+                    'total_tokens': tokens,
+                    'total_cost': cost,
+                    'formatted_summary': self.llm_client.get_formatted_summary()
+                }
+            else:
+                # 回退到全局统计
+                from .utils.cost_tracker import get_total_costs
+                costs = get_total_costs()
+                return {
+                    'total_tokens': {
+                        'prompt_tokens': costs.total_prompt_tokens,
+                        'completion_tokens': costs.total_completion_tokens,
+                        'total_tokens': costs.total_tokens
+                    },
+                    'total_cost': costs.total_cost,
+                    'formatted_summary': get_formatted_cost_summary()
+                }
+        except Exception as e:
+            print(f"获取成本信息失败: {str(e)}")
+            return {
+                'total_tokens': {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0},
+                'total_cost': 0.0,
+                'formatted_summary': '成本追踪未启用'
+            }
+
+
+def create_agent(config_file: Optional[str] = None, skip_validation: bool = False) -> DeepSearchAgent:
     """
     创建Deep Search Agent实例的便捷函数
-    
+
     Args:
         config_file: 配置文件路径
-        
+        skip_validation: 是否跳过验证（用于测试）
+
     Returns:
         DeepSearchAgent实例
     """
-    config = load_config(config_file)
+    config = load_config(config_file, skip_validation)
     return DeepSearchAgent(config)

@@ -1,0 +1,19 @@
+[33m4b0d35a[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m 冗余代码清理完成：删除max_tokens残留、重复方法、修复格式warning，代码更规范
+[33mfb0a4a3[m 备份当前全流程稳定版本，准备做冗余代码清理
+[33m65d0475[m 修复核心功能：解决节点6/7 max_tokens报错、结论空泛问题、Streamlit配置报错，当前版本全流程稳定可运行
+[33m374b141[m feat: 学术模式增加节点1/2/4/6/7本地文件缓存，避免重复调用LLM，稳定限流问题
+[33m7d803d2[m 优化：完善学术搜索Agent交互与结论生成
+[33m30f6a8d[m feat: 实现轻量级多智能体协作架构
+[33m51031b1[m chore: 更新 OpenAlex 搜索超时和重试逻辑，优化测试脚本
+[33m7567585[m feat: 学术模式集成 Crossref 数据源及优化
+[33mc5a0746[m feat: 完成健康溯源模式阶段二优化
+[33m0fc448a[m 漏了一个prompts__init__程序没提交
+[33m0339053[m feat: 引入Chain-of-Thought推理优化反思和首次搜索节点 - 修改 REFLECTION_PROMPT 和 SEARCH_QUERY_PROMPT，要求LLM输出推理过程 - 增强 FirstSearchNode 和 ReflectionNode 解析CoT格式，支持中英文冒号 - 保留原有JSON解析作为fallback，确保向后兼容 - 添加单元测试验证CoT格式解析和边缘情况 - 修复 ReflectionNode 偶尔解析失败的问题
+[33m1ec1817[m feat: 为反思节点引入Chain-of-Thought推理
+[33m343ac28[m feat: 完成模块1全量优化 | BM25检索+Prompt压缩+本地缓存+速率限制
+[33m85b9c07[m feat: 支持智谱AI，优化Streamlit界面，添加配置模板
+[33macb0a0b[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m Update README.md
+[33m666a7be[m Update README.md
+[33m496828b[m Provide running examples and simplify the startup process.
+[33mdf810cc[m Fixing bugs in the web interface.
+[33me4504b3[m first commit

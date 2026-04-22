@@ -83,10 +83,10 @@ class ReportFormattingNode(BaseNode):
     def process_output(self, output: str) -> str:
         """
         处理LLM输出，清理Markdown格式
-        
+
         Args:
             output: LLM原始输出
-            
+
         Returns:
             清理后的Markdown报告
         """
@@ -94,17 +94,33 @@ class ReportFormattingNode(BaseNode):
             # 清理响应文本
             cleaned_output = remove_reasoning_from_output(output)
             cleaned_output = clean_markdown_tags(cleaned_output)
-            
+
             # 确保报告有基本结构
             if not cleaned_output.strip():
                 return "# 报告生成失败\n\n无法生成有效的报告内容。"
-            
+
             # 如果没有标题，添加一个默认标题
             if not cleaned_output.strip().startswith('#'):
                 cleaned_output = "# 深度研究报告\n\n" + cleaned_output
-            
-            return cleaned_output.strip()
-            
+
+            # 移除末尾多余的空标题（如 "#。）
+            lines = cleaned_output.split('\n')
+            # 过滤掉空行或只包含符号的行
+            filtered_lines = []
+            for line in lines:
+                stripped = line.strip()
+                # 跳过空行或只包含标题符号（如 #, ##, ###）的行
+                if stripped and stripped not in ['#', '##', '###', '####', '#####', '######']:
+                    filtered_lines.append(line)
+                # 如果有内容，保留空行
+                elif filtered_lines and not stripped:
+                    filtered_lines.append(line)
+
+            # 重新组合，去除末尾多余的空行
+            cleaned_output = '\n'.join(filtered_lines).strip()
+
+            return cleaned_output
+
         except Exception as e:
             self.log_error(f"处理输出失败: {str(e)}")
             return "# 报告处理失败\n\n报告格式化过程中发生错误。"

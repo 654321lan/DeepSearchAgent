@@ -86,7 +86,7 @@ class Config:
                 openai_api_key=getattr(config_module, "OPENAI_API_KEY", None),
                 zhipu_api_key=getattr(config_module, "ZHIPU_API_KEY", None),
                 tavily_api_key=getattr(config_module, "TAVILY_API_KEY", None),
-                default_llm_provider=getattr(config_module, "DEFAULT_LLM_PROVIDER", "deepseek"),
+                default_llm_provider=getattr(config_module, "LLM_PROVIDER", "deepseek"),
                 deepseek_model=getattr(config_module, "DEEPSEEK_MODEL", "deepseek-chat"),
                 openai_model=getattr(config_module, "OPENAI_MODEL", "gpt-4o-mini"),
                 zhipu_model=getattr(config_module, "ZHIPU_MODEL", "glm-4"),
@@ -131,12 +131,13 @@ class Config:
             )
 
 
-def load_config(config_file: Optional[str] = None) -> Config:
+def load_config(config_file: Optional[str] = None, skip_validation: bool = False) -> Config:
     """
     加载配置
 
     Args:
         config_file: 配置文件路径，如果不指定则使用默认路径
+        skip_validation: 是否跳过验证（用于测试）
 
     Returns:
         配置对象
@@ -160,7 +161,7 @@ def load_config(config_file: Optional[str] = None) -> Config:
     config = Config.from_file(file_to_load)
 
     # 验证配置
-    if not config.validate():
+    if not skip_validation and not config.validate():
         raise ValueError("配置验证失败，请检查配置文件中的API密钥")
 
     return config

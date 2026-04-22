@@ -1,5 +1,5 @@
 from .base_agent import BaseAgent
-from src.utils.evidence import get_evidence_level, get_evidence_priority
+from src.utils.evidence import get_evidence_level, get_evidence_priority, GRADELevel
 
 def get_evidence_score(paper: dict, priority: int) -> int:
     """计算证据质量分数（综合评分 0-100）"""
@@ -42,12 +42,18 @@ class EvidenceAgent(BaseAgent):
         # 为每篇论文添加证据等级
         for p in papers:
             try:
+                # 保留反思补充标识
+                is_supplement = p.get('is_reflection_supplement', False)
+
                 # 修复：get_evidence_level 返回元组 (level, details)，需要解构
                 level, details = get_evidence_level(p)
                 p['evidence_level'] = level.value  # 存储字符串值
                 # 只在details不为空时更新grade_details
                 if details and details.get('study_type'):
                     p['grade_details'] = details
+                # 恢复反思补充标识
+                if is_supplement:
+                    p['is_reflection_supplement'] = True
                 # 添加证据片段（从论文标题和摘要中提取）
                 snippets = []
                 title = p.get('title', '')
@@ -68,13 +74,17 @@ class EvidenceAgent(BaseAgent):
                 logging.error(f"处理论文时出错: {p.get('title', '未知标题')}, 错误: {e}")
                 # 确保即使出错也有默认值
                 if 'evidence_level' not in p:
-                    p['evidence_level'] = 'GRADE 极低级'
+                    p['evidence_level'] = GRADELevel.VERY_LOW.value
                 if 'evidence_snippets' not in p:
                     p['evidence_snippets'] = ["无可用证据片段"]
                 if 'evidence_priority' not in p:
                     p['evidence_priority'] = 1
                 if 'evidence_score' not in p:
                     p['evidence_score'] = 20
+
+                # 保留反思补充标识
+                if p.get('is_reflection_supplement', False):
+                    p['is_reflection_supplement'] = True
 
         # 计算综合分数
         for idx, p in enumerate(papers):
@@ -110,9 +120,9 @@ class EvidenceAgent(BaseAgent):
                 0.2 * year_norm         # 年份权重
             )
 
-        # 按综合分数降序排序
-        papers.sort(key=lambda x: -x.get('combined_score', 0))
-        papers = papers[:5]  # 取前5篇
+        # 先按证据等级排序（4=高,3=中,2=低,1=极低），然后按综合分数降序排序
+        papers.sort(key=lambda x: (x.get('evidence_priority', 1), -x.get('combined_score', 0)))
+        papers = papers[:20]  # 取前20篇，优先保留高质量文献
 
         return {
             'papers': papers,

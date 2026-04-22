@@ -1,5 +1,5 @@
 """
-智谱AI LLM实现
+智谱AI LLM实现类
 使用智谱AI API进行文本生成（OpenAI兼容接口）
 """
 
@@ -10,6 +10,7 @@ import httpx
 from typing import Optional, Dict, Any
 from openai import OpenAI
 from .base import BaseLLM
+from ..utils.cost_tracker import record_cost_from_response
 
 
 class ZhipuLLM(BaseLLM):
@@ -23,13 +24,13 @@ class ZhipuLLM(BaseLLM):
         初始化智谱AI客户端
 
         Args:
-            api_key: 智谱AI API密钥，如果不提供则从环境变量读取
-            model_name: 模型名称，默认使用glm-4
+            api_key: 智谱AI API密钥, 如果不提供则从环境变量读取
+            model_name: 模型名称, 默认使用glm-4
         """
         if api_key is None:
             api_key = os.getenv("ZHIPU_API_KEY")
             if not api_key:
-                raise ValueError("智谱AI API Key未找到！请设置ZHIPU_API_KEY环境变量或在初始化时提供")
+                raise ValueError("智谱AI API Key未找到! 请设置ZHIPU_API_KEY环境变量或在初始化时提供")
 
         super().__init__(api_key, model_name)
 
@@ -80,7 +81,15 @@ class ZhipuLLM(BaseLLM):
             # 提取回复内容
             if response.choices and response.choices[0].message:
                 content = response.choices[0].message.content
-                return self.validate_response(content)
+                validated_content = self.validate_response(content)
+
+                # 将响应对象存储到实例中，供包装器访问
+                self._last_response = {
+                    'content': validated_content,
+                    'usage': response.usage if hasattr(response, 'usage') else None
+                }
+
+                return validated_content
             else:
                 return ""
 

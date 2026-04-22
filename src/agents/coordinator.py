@@ -2,6 +2,7 @@ from .query_analyzer_agent import QueryAnalyzerAgent
 from .search_agent import SearchAgent
 from .evidence_agent import EvidenceAgent
 from .summary_agent import SummaryAgent
+from src.nodes.reflection_supplement_node import ReflectionSupplementNode
 from src.llms.zhipu import ZhipuLLM
 from src.tools.crossref_search import CrossrefSearch
 from src.tools.openalex_search import OpenAlexSearch
@@ -19,15 +20,16 @@ class AcademicCoordinator:
         self.search_agent = SearchAgent("SearchAgent", crossref_search, openalex_search)
         self.evidence_agent = EvidenceAgent("EvidenceAgent", llm)
         self.summary_agent = SummaryAgent("SummaryAgent", llm)
+        self.reflection_supplement_node = ReflectionSupplementNode(llm)
         self.cache = QueryCache()
-        
+
         # 缓存配置
         self.enable_cache = True
         self.cache_ttl = 24 * 3600  # 24小时过期
         self.max_cache_size = 1000
         self.cache_file = "academic_cache.pkl"
         self.query_cache = {}
-        
+
         # 加载现有缓存
         self._load_query_cache()
 
@@ -248,14 +250,29 @@ class AcademicCoordinator:
                 reverse=True
             )
 
-            # 7. 证据分析
+            # 7. 反思补充检索（节点4.5）
+            supplement_result = self.reflection_supplement_node.process({
+                'query': query,
+                'papers': sorted_papers
+            })
+
+            if supplement_result['status'] == 'success':
+                sorted_papers = supplement_result['papers']
+                print(f"📊 补充检索统计:")
+                print(f"   前后文献数量: {supplement_result['comparison']['before']} → {supplement_result['comparison']['after']}")
+                if supplement_result['comparison']['increase'] > 0:
+                    print(f"   新增文献: {supplement_result['comparison']['increase']} 篇")
+            else:
+                print("⚠️ 反思补充检索失败，跳过此步骤")
+
+            # 8. 证据分析
             evidence_result = self.evidence_agent.process({'papers': sorted_papers})
             if evidence_result['status'] != 'success':
                 error_result = ("证据分析失败", [])
                 self.cache.set(cache_key, error_result)
                 return error_result
 
-            # 8. 总结
+            # 9. 总结
             summary_result = self.summary_agent.process({
                 'query': query,
                 'papers': evidence_result['papers']

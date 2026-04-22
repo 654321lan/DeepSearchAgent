@@ -216,12 +216,13 @@ class SemanticGlobalCache:
 class StreamlitUIOrchestrator:
     """Streamlit UI编排器 - 负责分步执行流程管理"""
 
-    # 7个执行节点定义
+    # 8个执行节点定义（学术模式）
     NODES = [
         {"id": 1, "name": "问题拆解与关键词生成", "key": "decompose"},
         {"id": 2, "name": "多源并发检索", "key": "search"},
         {"id": 3, "name": "数据去重与融合", "key": "deduplicate"},
         {"id": 4, "name": "证据等级标注", "key": "evidence"},
+        {"id": 4.5, "name": "反思补充检索", "key": "reflection_supplement"},
         {"id": 5, "name": "文献筛选与排序", "key": "filter"},
         {"id": 6, "name": "结论提取与生成", "key": "conclude"},
         {"id": 7, "name": "报告生成与导出", "key": "report"},
@@ -250,11 +251,17 @@ class StreamlitUIOrchestrator:
     def _init_session_state(self):
         """初始化Streamlit会话状态"""
         if "orchestrator_state" not in st.session_state:
+            # 使用字符串形式的节点ID，避免浮点数问题
+            node_status_init = {}
+            for node in self.NODES:
+                node_id = str(node["id"]) if isinstance(node["id"], float) else node["id"]
+                node_status_init[node_id] = NodeStatus.PENDING.value
+
             st.session_state.orchestrator_state = {
                 "query": "",
                 "mode": "general",
                 "current_node": 0,
-                "node_status": {node["id"]: NodeStatus.PENDING.value for node in self.NODES},
+                "node_status": node_status_init,
                 "node_results": {},
                 "node_errors": {},
                 "agent_state": None,
@@ -268,7 +275,21 @@ class StreamlitUIOrchestrator:
         self.query = state.get("query", "")
         self.mode = state.get("mode", "general")
         self.current_node = state.get("current_node", 0)
-        self.node_status = {k: NodeStatus(v) for k, v in state.get("node_status", {}).items()}
+
+        # 修复节点状态的加载，处理字符串形式的ID
+        raw_node_status = state.get("node_status", {})
+        self.node_status = {}
+        for k, v in raw_node_status.items():
+            # 将字符串形式的ID转换回原始类型
+            try:
+                if "." in k:
+                    node_id = float(k)
+                else:
+                    node_id = int(k)
+            except:
+                node_id = k
+            self.node_status[node_id] = NodeStatus(v)
+
         self.node_results = state.get("node_results", {})
         self.node_errors = state.get("node_errors", {})
 
@@ -278,11 +299,17 @@ class StreamlitUIOrchestrator:
 
     def _save_state(self):
         """保存到会话状态"""
+        # 将节点ID转换为字符串形式保存，避免浮点数问题
+        node_status_str = {}
+        for k, v in self.node_status.items():
+            node_id_str = str(k) if isinstance(k, float) else k
+            node_status_str[node_id_str] = v.value
+
         st.session_state.orchestrator_state = {
             "query": self.query,
             "mode": self.mode,
             "current_node": self.current_node,
-            "node_status": {k: v.value for k, v in self.node_status.items()},
+            "node_status": node_status_str,
             "node_results": self.node_results,
             "node_errors": self.node_errors,
             "agent_state": self.agent.state,
@@ -324,6 +351,8 @@ class StreamlitUIOrchestrator:
                 self._execute_node3_deduplicate()
             elif node_id == 4:
                 self._execute_node4_evidence()
+            elif node_id == 4.5:
+                self._execute_node4_5_reflection_supplement()
             elif node_id == 5:
                 self._execute_node5_filter()
             elif node_id == 6:
@@ -338,6 +367,13 @@ class StreamlitUIOrchestrator:
                 self.node_status[node_id] = NodeStatus.COMPLETED
                 self.current_node = max(self.current_node, node_id)
                 self._save_state()
+
+                # 特殊处理：节点4完成后自动执行节点4.5
+                if node_id == 4:
+                    logger.info("节点4执行完成，自动执行节点4.5")
+                    # 自动执行节点4.5
+                    st.session_state.node_to_execute = 4.5
+                    st.rerun()
             else:
                 # 如果没有结果，使用降级方案生成基础结果
                 logger.warning(f"节点{node_id}未生成结果，使用降级方案")
@@ -368,6 +404,13 @@ class StreamlitUIOrchestrator:
                     # 保存降级标记，用于前端友好提示
                     self.node_results[node_id]["_fallback_used"] = True
                     self.node_results[node_id]["_fallback_reason"] = str(e)
+
+                    # 特殊处理：节点4完成后自动执行节点4.5
+                    if node_id == 4:
+                        logger.info("节点4执行完成（降级方案），自动执行节点4.5")
+                        st.session_state.node_to_execute = 4.5
+                        st.rerun()
+
                     self._save_state()
                     logger.info(f"节点{node_id}降级方案成功")
                     return True
@@ -465,13 +508,10 @@ class StreamlitUIOrchestrator:
                 if 6 in self.node_results:
                     papers = self.node_results[6].get("papers", [])
                     conclusion = self.node_results[6].get("conclusion", "")
-                    table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
-                    for p in papers[:10]:
-                        title_short = p.get('title', '')[:50] + ('...' if len(p.get('title', '')) > 50 else '')
-                        year = p.get('year', 0)
-                        level = p.get('evidence_level', '未知')
-                        finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
-                        table += f"| {title_short} | {year} | {level} | {finding} |\n"
+                    
+                    # 使用统一的表格格式
+                    table = self._generate_evidence_table(papers)
+                    
                     final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{conclusion}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
                     return {
                         "type": "fallback",
@@ -676,6 +716,9 @@ class StreamlitUIOrchestrator:
                 papers = search_result.get("papers", [])
 
                 for paper in papers:
+                    # 摘要处理
+                    paper["abstract"] = paper.get("abstract", "") or "无摘要"
+
                     # 优先从journal提取，无则取publisher/venue/container-title（兼容不同数据源）
                     paper["journal"] = paper.get("journal") or paper.get("publisher") or paper.get("venue") or paper.get("container-title") or "未公开来源"
                     # 年份兜底
@@ -823,7 +866,7 @@ class StreamlitUIOrchestrator:
                 for paper in papers:
                     try:
                         level_obj, details = get_evidence_level(paper)
-                        paper['evidence_level'] = str(level_obj)
+                        paper['evidence_level'] = level_obj.value
                         paper['grade_details'] = details
                         # 修复：传入枚举对象而非字符串
                         paper['evidence_priority'] = get_evidence_priority(level_obj)
@@ -890,13 +933,144 @@ class StreamlitUIOrchestrator:
             self._save_state()
             raise
 
+    def _execute_node4_5_reflection_supplement(self):
+        """节点4.5：反思补充检索"""
+        try:
+            logger.info("执行节点4.5：反思补充检索")
+
+            if self.mode == "academic":
+                # 1. 先读取缓存
+                cached_data = self.cache.get(self.query,"4.5")  # 使用节点ID 5 缓存
+                if cached_data is not None:
+                    logger.info("✅ 节点4.5从缓存读取成功")
+                    self.node_results[4.5] = cached_data
+                    # 保存状态，确保后续节点能正确加载
+                    self._save_state()
+                    return
+
+                # 2. 缓存未命中，执行反思补充检索
+                from src.nodes.reflection_supplement_node import ReflectionSupplementNode
+
+                papers = self.node_results[4].get("papers", [])
+                if not papers:
+                    # 没有论文，直接返回空结果
+                    self.node_results[4.5] = {
+                        "type": "academic",
+                        "papers": [],
+                        "stats": {
+                            "supplement_queries": [],
+                            "search_count": 0,
+                            "new_papers_count": 0,
+                            "original_count": 0,
+                            "status": "no_papers"
+                        },
+                        "comparison": {
+                            "before": 0,
+                            "after": 0,
+                            "increase": 0
+                        }
+                    }
+                    self.cache.set(self.query, "4_5", self.node_results[4.5])
+                    self._save_state()
+                    return
+
+                # 执行反思补充检索
+                supplement_node = ReflectionSupplementNode(self.agent.llm_client, self.config)
+                supplement_result = supplement_node.process({
+                    'query': self.query,
+                    'papers': papers
+                })
+
+                result = {
+                    "type": "academic",
+                    "papers": supplement_result.get("papers", []),
+                    "stats": supplement_result.get("stats", {}),
+                    "comparison": supplement_result.get("comparison", {}),
+                    "message": supplement_result.get("status", "success")
+                }
+
+                # 3. 保存结果到缓存
+                self.cache.set(self.query, "4_5", result)
+                self.node_results[4.5] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+                # 打印补充检索统计
+                stats = supplement_result.get("stats", {})
+                comparison = supplement_result.get("comparison", {})
+                if comparison.get("increase", 0) > 0:
+                    logger.info(f"📊 反思补充检索新增 {comparison['increase']} 篇文献")
+                    logger.info(f"文献总数: {comparison['before']} → {comparison['after']}")
+
+            else:
+                # 通用模式：不需要反思补充检索
+                result = {
+                    "type": "general",
+                    "message": "通用模式不需要反思补充检索"
+                }
+
+                # 通用模式也缓存
+                self.cache.set(self.query, "4_5", result)
+                self.node_results[4.5] = result
+                # 保存状态，确保后续节点能正确加载
+                self._save_state()
+
+        except Exception as e:
+            logger.error(f"节点4.5执行异常: {str(e)}", exc_info=True)
+            # 使用降级方案
+            try:
+                papers = self.node_results[4].get("papers", [])
+                result = {
+                    "type": "fallback",
+                    "papers": papers,
+                    "stats": {
+                        "supplement_queries": [],
+                        "search_count": 0,
+                        "new_papers_count": 0,
+                        "original_count": len(papers),
+                        "status": "error"
+                    },
+                    "comparison": {
+                        "before": len(papers),
+                        "after": len(papers),
+                        "increase": 0
+                    },
+                    "message": "反思补充检索失败（异常降级）"
+                }
+                self.cache.set(self.query, "4_5", result)
+                self.node_results[4.5] = result
+            except:
+                self.node_results[4.5] = {
+                    "type": "fallback",
+                    "papers": [],
+                    "stats": {
+                        "supplement_queries": [],
+                        "search_count": 0,
+                        "new_papers_count": 0,
+                        "original_count": 0,
+                        "status": "error"
+                    },
+                    "comparison": {
+                        "before": 0,
+                        "after": 0,
+                        "increase": 0
+                    }
+                }
+            self._save_state()
+            raise
+
     def _execute_node5_filter(self):
         """节点5：文献筛选与排序"""
+        logger.info("开始执行节点5")
         try:
             logger.info("执行节点5：文献筛选与排序")
 
             if self.mode == "academic":
-                papers = self.node_results[4].get("papers", [])
+                # 优先使用节点4.5的结果，如果没有则使用节点4的结果
+                if 4.5 in self.node_results:
+                    papers = self.node_results[4.5].get("papers", [])
+                else:
+                    papers = self.node_results[4].get("papers", [])
 
                 # 按证据等级优先级+发表年份降序排序
                 sorted_papers = sorted(
@@ -936,6 +1110,7 @@ class StreamlitUIOrchestrator:
             try:
                 papers = self.node_results[4].get("papers", [])
                 sorted_papers = sorted(papers, key=lambda x: x.get('year', 0), reverse=True)
+                logger.info("节点5执行异常，使用降级方案")
                 self.node_results[5] = {
                     "type": "fallback",
                     "papers": sorted_papers,
@@ -949,18 +1124,19 @@ class StreamlitUIOrchestrator:
 
     def _execute_node6_conclude(self):
         """节点6：结论提取与生成"""
+        logger.info("开始执行节点6")
         try:
             logger.info("执行节点6：结论提取与生成")
 
             if self.mode == "academic":
                 # 1. 先读取本地缓存
                 cached_data = self.cache.get(self.query, 6)
-            if cached_data is not None:
-                logger.info("✅ 节点6从缓存读取成功")
-                self.node_results[6] = cached_data
-                # 保存状态，确保后续节点能正确加载
-                self._save_state()
-                return
+                if cached_data is not None:
+                    logger.info("✅ 节点6从缓存读取成功")
+                    self.node_results[6] = cached_data
+                    # 保存状态，确保后续节点能正确加载
+                    self._save_state()
+                    return
 
             # 2. 缓存未命中，检查令牌桶限流
             if not self.cache.acquire_token():
@@ -1033,8 +1209,8 @@ class StreamlitUIOrchestrator:
 
 相关文献：
 """
-                    
-                    for i, paper in enumerate(papers[:10]):  # 最多处理前10篇高质量文献
+
+                    for i, paper in enumerate(papers):  # 处理全部20篇文献
                         title = paper.get('title', '')
                         year = paper.get('year', '')
                         evidence_level = paper.get('evidence_level', '')
@@ -1053,9 +1229,11 @@ class StreamlitUIOrchestrator:
 
 ## 核心结论
 基于上述高质量文献证据，总结主要发现和核心观点。
+【重要要求】在每条结论后添加引用文献序号，使用方括号格式，如[1]、[2]，标注支持该结论的文献来源。
 
 ## 具体循证建议
 提供基于证据的具体临床实践建议，包括诊断、治疗、预防等方面。
+【重要要求】在每条建议后添加引用文献序号，使用方括号格式，如[1]、[2-5]，标注支持该建议的文献来源。支持多条文献的建议使用连字符表示范围。
 
 【强制规则要求】
 1. 必须输出完整、无截断的结构化内容
@@ -1063,10 +1241,11 @@ class StreamlitUIOrchestrator:
 3. 每条建议必须有完整结尾，禁止半句话输出
 4. 确保内容完整，避免因长度限制被截断
 5. 核心结论和具体循证建议都必须有明确的结束标志
+6. 必须在结论和建议后添加文献引用序号，明确标注来源
 
 【输出格式要求】
-- 核心结论：至少3-5个完整句子，总结主要发现
-- 具体循证建议：每条建议必须完整，包含诊断、治疗、预防等具体内容
+- 核心结论：至少3-5个完整句子，总结主要发现，每个结论后添加文献引用
+- 具体循证建议：每条建议必须完整，包含诊断、治疗、预防等具体内容，每个建议后添加文献引用
 - 所有格式标签必须闭合，无未闭合的**或*标记
 """
 
@@ -1183,10 +1362,74 @@ class StreamlitUIOrchestrator:
             self._save_state()
             raise
 
+    def _cleanup_format_markers(self, text: str) -> str:
+        """清理格式标记，包括多余的空格、#。等标记"""
+        if not text:
+            return text
+
+        # 清理多余的空格
+        lines = text.split('\n')
+        cleaned_lines = []
+
+        for line in lines:
+            line = line.strip()
+            # 移除行首和行尾的多余空格
+            line = line.strip()
+
+            # 清理多余的#。标记和其他格式问题
+            if line.endswith('#。'):
+                line = line[:-2].strip()
+            elif line.endswith('#。#'):
+                line = line[:-3].strip()
+            elif line.endswith('##'):
+                line = line[:-2].strip()
+            elif line.endswith('#'):
+                line = line[:-1].strip()
+            elif line.endswith('。.'):
+                line = line[:-1].strip()
+            elif line == '#' or line == '#。':
+                line = ""  # 完全空的标记行
+
+            # 清理行内多余的空格，但保留中文之间的正常空格
+            line = ' '.join(line.split())
+
+            if line:  # 只保留非空行
+                cleaned_lines.append(line)
+
+        return '\n'.join(cleaned_lines)
+    
+    def _cleanup_core_conclusion(self, core_content: str) -> str:
+        """专门清理核心结论部分的多余标记"""
+        if not core_content:
+            return ""
+
+        # 移除标题标记
+        core_content = core_content.replace('## 核心结论', '').strip()
+        core_content = core_content.replace('核心结论', '').strip()
+
+        # 清理多余的空格和标记
+        core_content = self._cleanup_format_markers(core_content)
+
+        # 移除结尾的多余标记，但保留有意义的文本
+        core_content = core_content.rstrip('。').rstrip('.').rstrip('#').rstrip('。').strip()
+
+        # 如果清理后内容为空，返回默认文本
+        if not core_content:
+            return "基于文献证据分析，建议进一步研究。"
+
+        # 确保以句号结束
+        if core_content and not core_content.endswith(('.', '。', '！', '？')):
+            core_content += '。'
+
+        return core_content
+    
     def _validate_and_fix_conclusion(self, conclusion: str, papers: List[Dict]) -> str:
         """验证并修复结论内容的完整性和格式"""
         if not conclusion:
             return "## 核心结论\n基于文献证据，建议进一步分析具体内容。\n\n## 具体循证建议\n请结合临床实际情况制定个体化治疗方案。"
+        
+        # 首先清理多余的空格和标记
+        conclusion = self._cleanup_format_markers(conclusion)
         
         # 检查内容截断
         lines = conclusion.split('\n')
@@ -1246,6 +1489,9 @@ class StreamlitUIOrchestrator:
                     core_content = conclusion[core_start:suggestions_start].strip()
                     suggestions_content = conclusion[suggestions_start:].strip()
                     
+                    # 清理核心结论部分的多余标记
+                    core_content = self._cleanup_core_conclusion(core_content)
+                    
                     # 修复格式标签
                     core_content = core_content.replace('**', '') if unclosed_bold else core_content
                     suggestions_content = suggestions_content.replace('**', '') if unclosed_bold else suggestions_content
@@ -1254,7 +1500,7 @@ class StreamlitUIOrchestrator:
                     if not core_content.endswith(('.', '。')):
                         core_content += '。'
                     
-                    fixed_conclusion = f"{core_content}\n\n{suggestions_content}"
+                    fixed_conclusion = f"## 核心结论\n{core_content}\n\n## 具体循证建议\n{suggestions_content}"
                     return fixed_conclusion
             
             return base_conclusion
@@ -1288,9 +1534,12 @@ class StreamlitUIOrchestrator:
         has_core_conclusion = '## 核心结论' in report
         has_suggestions = '## 具体循证建议' in report
         
-        # 如果需要修复
-        if truncated or unclosed_bold or unclosed_italic or not has_evidence_table or not has_core_conclusion or not has_suggestions:
-            logger.warning(f"⚠️ 检测到报告内容问题：截断={truncated}, 加粗未闭合={unclosed_bold}, 斜体未闭合={unclosed_italic}")
+        # 检查是否已经包含风险提示
+        has_risk_disclaimer = '---\n⚠️ **重要免责声明**' in report
+        
+        # 如果需要修复或缺少风险提示
+        if truncated or unclosed_bold or unclosed_italic or not has_evidence_table or not has_core_conclusion or not has_suggestions or not has_risk_disclaimer:
+            logger.warning(f"⚠️ 检测到报告内容问题：截断={truncated}, 加粗未闭合={unclosed_bold}, 斜体未闭合={unclosed_italic}, 缺少风险提示={not has_risk_disclaimer}")
             
             # 如果原报告有可用部分，尽量保留
             if has_core_conclusion and has_suggestions:
@@ -1312,6 +1561,9 @@ class StreamlitUIOrchestrator:
                     if not suggestions_content.endswith(('.', '。')):
                         suggestions_content += '。'
                     
+                    # 修复建议部分的格式，确保正确分段
+                    suggestions_content = self._fix_suggestions_format(suggestions_content)
+                    
                     # 生成完整的报告结构
                     table = self._generate_evidence_table(papers)
                     fixed_report = f"""# 文献证据表格
@@ -1325,25 +1577,184 @@ class StreamlitUIOrchestrator:
 {suggestions_content}
 
 ---
-⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"""
+⚠️ **重要免责声明**
+
+1. 本工具仅汇总公开学术论文中的研究发现，**不构成任何医疗建议**。
+2. 内容仅供参考，**不能替代专业医生的诊断、治疗建议或处方**。
+3. 请勿根据本信息自行调整用药、饮食或生活习惯。
+4. 如有健康疑虑，请务必**咨询专业医疗人员**。
+5. 文献结论可能存在时效性、研究局限或争议，使用风险由用户自行承担。
+"""
                     
                     return fixed_report
             
             # 完全重新生成报告
             return self._generate_base_report(papers, query)
         
+        # 如果报告格式完整但缺少风险提示，添加风险提示
+        if not has_risk_disclaimer:
+            logger.info("报告格式完整但缺少风险提示，正在添加...")
+            risk_disclaimer = """
+
+---
+⚠️ **重要免责声明**
+
+1. 本工具仅汇总公开学术论文中的研究发现，**不构成任何医疗建议**。
+2. 内容仅供参考，**不能替代专业医生的诊断、治疗建议或处方**。
+3. 请勿根据本信息自行调整用药、饮食或生活习惯。
+4. 如有健康疑虑，请务必**咨询专业医疗人员**。
+5. 文献结论可能存在时效性、研究局限或争议，使用风险由用户自行承担。
+"""
+            # 如果报告格式完整但建议部分需要修复，修复建议格式
+        if has_core_conclusion and has_suggestions:
+            suggestions_start = report.find('## 具体循证建议')
+            if suggestions_start >= 0:
+                suggestions_content = report[suggestions_start:].strip()
+                fixed_suggestions = self._fix_suggestions_format(suggestions_content)
+                report = report[:suggestions_start] + fixed_suggestions
+        
+        # 如果报告格式完整但建议部分需要修复，修复建议格式
+        if has_core_conclusion and has_suggestions:
+            suggestions_start = report.find('## 具体循证建议')
+            if suggestions_start >= 0:
+                suggestions_content = report[suggestions_start:].strip()
+                fixed_suggestions = self._fix_suggestions_format(suggestions_content)
+                report = report[:suggestions_start] + fixed_suggestions
+        
+        return report + risk_disclaimer
+        
         return report
 
     def _generate_evidence_table(self, papers: List[Dict]) -> str:
         """生成文献证据表格"""
-        table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
-        for p in papers:
-            title_short = p['title'][:50] + ('...' if len(p['title']) > 50 else '')
-            year = p['year']
-            level = p['evidence_level']
-            finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
-            table += f"| {title_short} | {year} | {level} | {finding} |\n"
+        if not papers:
+            return "暂无相关文献数据"
+            
+        table = "| 序号 | 标题 | 作者 | 年份 | 期刊 | 证据等级 |\n|------|------|------|------|------|----------|\n"
+        for i, p in enumerate(papers[:15], 1):  # 限制显示前15篇，避免表格过长
+            # 处理标题
+            title = p.get('title', '') or '无标题'
+            # 如果是反思补充的论文，在标题后添加 [反思补充]
+            if p.get('is_reflection_supplement', False):
+                title += " [反思补充]"
+            if len(title) > 60:
+                title = title[:57] + "..."
+            
+            # 处理作者
+            authors = p.get('authors', '未知作者')
+            if len(authors) > 25:
+                authors = authors[:22] + "..."
+            
+            # 处理年份
+            year = p.get('year', 0) or 0
+            year_display = str(year) if year > 0 else "未知"
+            
+            # 处理期刊
+            journal = p.get('journal', '') or p.get('publisher', '') or '未指定期刊'
+            if len(journal) > 20:
+                journal = journal[:17] + "..."
+            
+            # 处理证据等级
+            evidence_level = p.get('evidence_level', '未知')
+            
+            table += f"| {i} | {title} | {authors} | {year_display} | {journal} | {evidence_level} |\n"
+        
+        if len(papers) > 15:
+            table += f"\n*注：仅显示前15篇文献，共检索到{len(papers)}篇相关文献*"
+        
         return table
+
+    def _fix_suggestions_format(self, suggestions_content: str) -> str:
+        """修复具体循证建议部分的格式，确保正确分段"""
+        if not suggestions_content:
+            return "## 具体循证建议\n\n请结合临床实际情况制定个体化治疗方案。"
+        
+        # 如果建议部分没有正确分段（所有内容挤在一起），添加换行符
+        lines = suggestions_content.split('\n')
+        fixed_lines = []
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # 如果是建议的开头（包含序号或项目符号），在前面添加空行
+            if (line.startswith(('对于', '美甲', '建议', '应', '应定期', '美甲产品', '美甲沙龙', '消费者', '公共卫生', '医疗机构')) and 
+                i > 0 and lines[i-1].strip() and not lines[i-1].startswith('##')):
+                fixed_lines.append('')  # 添加空行分隔
+            
+            fixed_lines.append(line)
+        
+        # 如果修复后内容没有变化，尝试更智能的分段
+        if len(fixed_lines) <= 3:
+            # 尝试按句子分割并重新格式化
+            import re
+            # 将内容按句号分割
+            sentences = re.split(r'[。！？]', suggestions_content)
+            sentences = [s.strip() for s in sentences if s.strip()]
+            
+            if len(sentences) > 1:
+                fixed_lines = ['## 具体循证建议', '']
+                for sentence in sentences:
+                    if sentence:
+                        # 为每个完整的建议添加项目符号
+                        if any(keyword in sentence for keyword in ['对于', '建议', '应', '应定期']):
+                            fixed_lines.append(f"- {sentence}。")
+                        else:
+                            fixed_lines.append(sentence + '。')
+                        fixed_lines.append('')  # 添加空行分隔
+        
+        # 确保以正确的标题开头
+        if not fixed_lines or not fixed_lines[0].startswith('## 具体循证建议'):
+            fixed_lines = ['## 具体循证建议', ''] + fixed_lines
+        
+        return '\n'.join(fixed_lines)
+
+    def _fix_suggestions_format(self, suggestions_content: str) -> str:
+        """修复具体循证建议部分的格式，确保正确分段"""
+        if not suggestions_content:
+            return "## 具体循证建议\n\n请结合临床实际情况制定个体化治疗方案。"
+        
+        # 如果建议部分没有正确分段（所有内容挤在一起），添加换行符
+        lines = suggestions_content.split('\n')
+        fixed_lines = []
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # 如果是建议的开头（包含序号或项目符号），在前面添加空行
+            if (line.startswith(('对于', '美甲', '建议', '应', '应定期', '美甲产品', '美甲沙龙', '消费者', '公共卫生', '医疗机构')) and 
+                i > 0 and lines[i-1].strip() and not lines[i-1].startswith('##')):
+                fixed_lines.append('')  # 添加空行分隔
+            
+            fixed_lines.append(line)
+        
+        # 如果修复后内容没有变化，尝试更智能的分段
+        if len(fixed_lines) <= 3:
+            # 尝试按句子分割并重新格式化
+            import re
+            # 将内容按句号分割
+            sentences = re.split(r'[。！？]', suggestions_content)
+            sentences = [s.strip() for s in sentences if s.strip()]
+            
+            if len(sentences) > 1:
+                fixed_lines = ['## 具体循证建议', '']
+                for sentence in sentences:
+                    if sentence:
+                        # 为每个完整的建议添加项目符号
+                        if any(keyword in sentence for keyword in ['对于', '建议', '应', '应定期']):
+                            fixed_lines.append(f"- {sentence}。")
+                        else:
+                            fixed_lines.append(sentence + '。')
+                        fixed_lines.append('')  # 添加空行分隔
+        
+        # 确保以正确的标题开头
+        if not fixed_lines or not fixed_lines[0].startswith('## 具体循证建议'):
+            fixed_lines = ['## 具体循证建议', ''] + fixed_lines
+        
+        return '\n'.join(fixed_lines)
 
     def _generate_base_report(self, papers: List[Dict], query: str) -> str:
         """生成基础报告（降级方案）"""
@@ -1383,7 +1794,17 @@ class StreamlitUIOrchestrator:
 {base_summary}
 
 ---
-⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"""
+⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。
+
+---
+⚠️ **重要免责声明**
+
+1. 本工具仅汇总公开学术论文中的研究发现，**不构成任何医疗建议**。
+2. 内容仅供参考，**不能替代专业医生的诊断、治疗建议或处方**。
+3. 请勿根据本信息自行调整用药、饮食或生活习惯。
+4. 如有健康疑虑，请务必**咨询专业医疗人员**。
+5. 文献结论可能存在时效性、研究局限或争议，使用风险由用户自行承担。
+"""
 
     def _execute_node7_report(self):
         """节点7：报告生成与导出"""
@@ -1406,14 +1827,23 @@ class StreamlitUIOrchestrator:
                     logger.warning("🚫 节点7：令牌不足，使用基础报告")
                     papers = self.node_results[6].get("papers", [])
 
-                    # 生成基础表格
-                    table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
+                    # 生成基础表格（使用完整格式）
+                    table = "| 作者 | 年份 | 期刊 | 标题 | 摘要 |\n|------|------|------|------|------|\n"
                     for p in papers:
-                        title_short = p.get('title', '')[:50] + ('...' if len(p.get('title', '')) > 50 else '')
+                        authors = p.get('authors', '未知作者')
+                        if len(authors) > 30:
+                            authors = authors[:27] + "..."
                         year = p.get('year', 0)
-                        level = p.get('evidence_level', '未知')
-                        finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
-                        table += f"| {title_short} | {year} | {level} | {finding} |\n"
+                        journal = p.get('journal', '') or '未指定期刊'
+                        if len(journal) > 30:
+                            journal = journal[:27] + "..."
+                        title = p.get('title', '') or '无标题'
+                        if len(title) > 50:
+                            title = title[:47] + "..."
+                        abstract = p.get('abstract', '') or '无摘要'
+                        if len(abstract) > 100:
+                            abstract = abstract[:97] + "..."
+                        table += f"| {authors} | {year} | {journal} | {title} | {abstract} |\n"
 
                     # 基础总结
                     base_summary = f"""## 核心结论
@@ -1422,7 +1852,7 @@ class StreamlitUIOrchestrator:
 ## 具体循证建议
 请结合临床实际情况和具体文献证据制定个体化治疗方案。"""
 
-                    final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{base_summary}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
+                    final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{base_summary}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。\n\n---\n⚠️ **重要免责声明**\n\n1. 本工具仅汇总公开学术论文中的研究发现，**不构成任何医疗建议**。\n2. 内容仅供参考，**不能替代专业医生的诊断、治疗建议或处方**。\n3. 请勿根据本信息自行调整用药、饮食或生活习惯。\n4. 如有健康疑虑，请务必**咨询专业医疗人员**。\n5. 文献结论可能存在时效性、研究局限或争议，使用风险由用户自行承担。"
 
                     result = {
                         "type": "academic",
@@ -1452,7 +1882,7 @@ class StreamlitUIOrchestrator:
 
                 # 生成总结（添加错误处理）
                 try:
-                    # 增强提示词，确保内容完整性和格式正确
+                    # 增强提示词，确保内容完整性和格式正确，并添加文献引用要求
                     enhanced_prompt = f"""
 基于以下文献证据，生成专业、详细、结构化的循证医学报告：
 
@@ -1461,7 +1891,7 @@ class StreamlitUIOrchestrator:
 相关文献：
 """
 
-                    for i, paper in enumerate(papers[:10]):  # 最多处理前10篇高质量文献
+                    for i, paper in enumerate(papers):  # 处理全部20篇文献
                         title = paper.get('title', '')
                         year = paper.get('year', '')
                         evidence_level = paper.get('evidence_level', '')
@@ -1485,9 +1915,11 @@ class StreamlitUIOrchestrator:
 
 ## 核心结论
 基于上述高质量文献证据，总结主要发现和核心观点。
+【重要要求】在每条结论后添加引用文献序号，使用方括号格式，如[1]、[2]，标注支持该结论的文献来源。
 
 ## 具体循证建议
 提供基于证据的具体临床实践建议，包括诊断、治疗、预防等方面。
+【重要要求】在每条建议后添加引用文献序号，使用方括号格式，如[1]、[2-5]，标注支持该建议的文献来源。支持多条文献的建议使用连字符表示范围。
 
 【强制规则要求】
 1. 必须输出完整、无截断的结构化内容
@@ -1495,10 +1927,11 @@ class StreamlitUIOrchestrator:
 3. 每条建议必须有完整结尾，禁止半句话输出
 4. 确保内容完整，避免因长度限制被截断
 5. 核心结论和具体循证建议都必须有明确的结束标志
+6. 必须在结论和建议后添加文献引用序号，明确标注来源
 
 【输出格式要求】
-- 核心结论：至少3-5个完整句子，总结主要发现
-- 具体循证建议：每条建议必须完整，包含诊断、治疗、预防等具体内容
+- 核心结论：至少3-5个完整句子，总结主要发现，每个结论后添加文献引用
+- 具体循证建议：每条建议必须完整，包含诊断、治疗、预防等具体内容，至少包含4条数字，每个建议后添加文献引用
 - 所有格式标签必须闭合，无未闭合的**或*标记
 - 确保报告结构完整，包含所有必要部分
 """
@@ -1537,6 +1970,22 @@ class StreamlitUIOrchestrator:
                 # 通用模式：报告已在节点6生成，这里保存
                 report = self.node_results[6].get("report", "")
 
+                # 确保报告包含风险提示
+                if not report.rstrip().endswith("---\n⚠️ **重要免责声明**"):
+                    # 添加风险提示
+                    disclaimer = """
+
+---
+⚠️ **重要免责声明**
+
+1. 本工具仅汇总公开学术论文中的研究发现，**不构成任何医疗建议**。
+2. 内容仅供参考，**不能替代专业医生的诊断、治疗建议或处方**。
+3. 请勿根据本信息自行调整用药、饮食或生活习惯。
+4. 如有健康疑虑，请务必**咨询专业医疗人员**。
+5. 文献结论可能存在时效性、研究局限或争议，使用风险由用户自行承担。
+"""
+                    report += disclaimer
+
                 self.node_results[7] = {
                     "type": "general",
                     "report": report,
@@ -1551,14 +2000,23 @@ class StreamlitUIOrchestrator:
             try:
                 papers = self.node_results[6].get("papers", [])
                 conclusion = self.node_results[6].get("conclusion", "")
-                table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
-                for p in papers[:10]:
-                    title_short = p.get('title', '')[:50] + ('...' if len(p.get('title', '')) > 50 else '')
+                table = "| 作者 | 年份 | 期刊 | 标题 | 摘要 |\n|------|------|------|------|------|\n"
+                for p in papers:
+                    authors = p.get('authors', '未知作者')
+                    if len(authors) > 30:
+                        authors = authors[:27] + "..."
                     year = p.get('year', 0)
-                    level = p.get('evidence_level', '未知')
-                    finding = p.get('key_finding', '基于文献证据')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
-                    table += f"| {title_short} | {year} | {level} | {finding} |\n"
-                final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{conclusion}\n\n---\n⚠️ **免责声明**：本工具仅提供学术文献参考，不构成医疗建议。具体诊疗请咨询专业医生。"
+                    journal = p.get('journal', '') or '未指定期刊'
+                    if len(journal) > 30:
+                        journal = journal[:27] + "..."
+                    title = p.get('title', '') or '无标题'
+                    if len(title) > 50:
+                        title = title[:47] + "..."
+                    abstract = p.get('abstract', '') or '无摘要'
+                    if len(abstract) > 100:
+                        abstract = abstract[:97] + "..."
+                    table += f"| {authors} | {year} | {journal} | {title} | {abstract} |\n"
+                final_report = f"# 文献证据表格\n\n{table}\n\n# 综合总结\n\n{conclusion}\n\n---\n⚠️ **重要免责声明**\n\n1. 本工具仅汇总公开学术论文中的研究发现，**不构成任何医疗建议**。\n2. 内容仅供参考，**不能替代专业医生的诊断、治疗建议或处方**。\n3. 请勿根据本信息自行调整用药、饮食或生活习惯。\n4. 如有健康疑虑，请务必**咨询专业医疗人员**。\n5. 文献结论可能存在时效性、研究局限或争议，使用风险由用户自行承担。"
                 result = {
                     "type": "fallback",
                     "report": final_report,
@@ -1570,23 +2028,11 @@ class StreamlitUIOrchestrator:
             except:
                 self.node_results[7] = {
                     "type": "fallback",
-                    "report": "## 暂无报告\n\n请完成前置节点后重新生成报告。",
+                    "report": "## 暂无报告\n\n请完成前置节点后重新生成报告。\n\n---\n⚠️ **重要免责声明**\n\n1. 本工具仅汇总公开学术论文中的研究发现，**不构成任何医疗建议**。\n2. 内容仅供参考，**不能替代专业医生的诊断、治疗建议或处方**。\n3. 请勿根据本信息自行调整用药、饮食或生活习惯。\n4. 如有健康疑虑，请务必**咨询专业医疗人员**。\n5. 文献结论可能存在时效性、研究局限或争议，使用风险由用户自行承担。",
                     "papers": []
                 }
             self._save_state()
             raise
-
-    def rerun_from_node(self, node_id: int):
-        """从指定节点重新执行（清除后续节点结果）"""
-        for nid in range(node_id, 8):
-            self.node_status[nid] = NodeStatus.PENDING
-            if nid in self.node_results:
-                del self.node_results[nid]
-            if nid in self.node_errors:
-                del self.node_errors[nid]
-
-        self.current_node = node_id - 1
-        self._save_state()
 
     def get_status_summary(self) -> Dict[str, Any]:
         """获取状态摘要"""
@@ -1598,6 +2044,16 @@ class StreamlitUIOrchestrator:
             "completed": completed,
             "current_node": self.current_node,
             "progress": (completed / total * 100) if total > 0 else 0
+        }
+
+    def get_cost_info(self) -> Dict[str, Any]:
+        """获取成本信息"""
+        if hasattr(self.agent, 'get_llm_cost_info'):
+            return self.agent.get_llm_cost_info()
+        return {
+            'total_tokens': None,
+            'total_cost': 0.0,
+            'formatted_summary': "成本追踪未启用"
         }
 
 
@@ -1644,7 +2100,7 @@ def main():
         "openai": "OpenAI"
     }
     PROVIDER_MODELS = {
-        "zhipu": ["glm-4.7", "glm-4.6v", "glm-4", "glm-4.5-air"],
+        "zhipu": ["glm-4.5-air","glm-4.7", "glm-4.6v", "glm-4" ],
         "deepseek": ["deepseek-chat"],
         "openai": ["gpt-4o-mini", "gpt-4o"]
     }
@@ -1804,6 +2260,34 @@ def main():
             st.progress(status["progress"] / 100)
             st.caption(f"进度: {status['completed']}/{status['total']}")
 
+            # 显示成本信息
+            cost_info = orchestrator.get_cost_info()
+            if cost_info['formatted_summary'] != "成本追踪未启用":
+                st.subheader("💰 API 成本统计")
+
+                # 显示成本概览
+                if cost_info['total_tokens']:
+                    col_cost1, col_cost2, col_cost3 = st.columns(3)
+                    with col_cost1:
+                        st.metric("总Token数", f"{cost_info['total_tokens'].get('total_tokens', 0):,}")
+                    with col_cost2:
+                        st.metric("提示Token", f"{cost_info['total_tokens'].get('prompt_tokens', 0):,}")
+                    with col_cost3:
+                        st.metric("补全Token", f"{cost_info['total_tokens'].get('completion_tokens', 0):,}")
+
+                # 显示总成本
+                st.metric("预估成本", f"¥{cost_info['total_cost']:.4f}")
+
+                # 显示详细统计
+                with st.expander("查看详细统计"):
+                    st.markdown(cost_info['formatted_summary'])
+
+                # 重置按钮
+                if st.button("🔄 重置成本统计", help="清空当前会话的Token统计"):
+                    orchestrator.agent.reset_llm_cost_tracking()
+                    st.success("成本统计已重置")
+                    st.rerun()
+
             # 显示节点导航
             for node in StreamlitUIOrchestrator.NODES:
                 node_id = node["id"]
@@ -1861,11 +2345,7 @@ def main():
                     if st.button("⚙️ 缓存配置", use_container_width=True):
                         st.session_state.show_cache_config = True
 
-            # 重置按钮
-            if st.button("🔄 重置流程", use_container_width=True):
-                orchestrator.reset()
-                st.rerun()
-
+            
         else:
             st.info("暂无进行中的任务，请在右侧输入查询开始研究")
 
@@ -1969,6 +2449,7 @@ def main():
         if st.session_state.orchestrator is not None and "node_to_execute" in st.session_state:
             try:
                 node_id = st.session_state.node_to_execute
+                logger.info(f"准备执行节点: {node_id}")
                 del st.session_state.node_to_execute
 
                 orchestrator = st.session_state.orchestrator
@@ -1981,6 +2462,14 @@ def main():
                     st.success(f"节点{node_id}执行完成！")
                     # 自动展开当前节点结果
                     st.session_state.expanded_node = node_id
+                    logger.info(f"节点{node_id}执行成功，设置expanded_node为{node_id}")
+
+                    # 特殊处理：节点4.5完成后自动执行节点5
+                    if node_id == 4.5:
+                        logger.info("节点4.5执行完成，自动执行节点5")
+                        st.session_state.node_to_execute = 5
+                        del st.session_state.expanded_node
+                        st.rerun()
                 else:
                     # 友好的错误提示，不显示技术细节
                     error_msg = orchestrator.node_errors.get(node_id, "该步骤遇到问题")
@@ -2002,6 +2491,7 @@ def main():
         # 显示节点结果
         if st.session_state.orchestrator is not None and "expanded_node" in st.session_state:
             node_id = st.session_state.expanded_node
+            logger.info(f"准备显示节点结果，expanded_node为: {node_id}")
             orchestrator = st.session_state.orchestrator
             orchestrator._load_state()
 
@@ -2012,32 +2502,34 @@ def main():
 
                 # 显示结果
                 if node_id in orchestrator.node_results:
+                    logger.info(f"显示节点{node_id}的结果，节点名称: {node_info['name']}")
                     display_node_result(node_id, orchestrator.node_results[node_id], orchestrator.mode)
 
-                    # 用户干预区域
-                    st.subheader("用户干预")
-                    col_a, col_b = st.columns(2)
+                    # 用户操作区域
+                    st.subheader("下一步操作")
+                    col_next = st.columns(1)[0]  # 使用单列，居中显示
 
-                    with col_a:
-                        if st.button(f"🔄 重新执行此节点及后续", key=f"rerun_{node_id}"):
-                            orchestrator.rerun_from_node(node_id)
-                            st.session_state.node_to_execute = node_id
+                    # 修复：根据当前节点ID找到下一个正确的节点
+                    next_node_info = None
+                    for node in StreamlitUIOrchestrator.NODES:
+                        if node["id"] == node_id:
+                            # 找到当前节点，获取下一个节点
+                            current_index = StreamlitUIOrchestrator.NODES.index(node)
+                            if current_index < len(StreamlitUIOrchestrator.NODES) - 1:
+                                next_node_info = StreamlitUIOrchestrator.NODES[current_index + 1]
+                                break
+                            break
+
+                    if next_node_info:
+                        next_node_id = next_node_info["id"]
+                        if st.button(
+                            f"▶️ 执行节点{next_node_id}: {next_node_info['name']}",
+                            type="primary",
+                            use_container_width=True
+                        ):
+                            st.session_state.node_to_execute = next_node_id
                             del st.session_state.expanded_node
                             st.rerun()
-
-                    with col_b:
-                        next_node = node_id + 1
-                        if next_node <= 7:
-                            if st.button(f"▶️ 执行下一个节点", key=f"next_{node_id}"):
-                                st.session_state.node_to_execute = next_node
-                                del st.session_state.expanded_node
-                                st.rerun()
-
-                        # 如果是最后一个节点，显示完成选项
-                        if node_id == 7:
-                            if st.button("📄 查看完整报告", key=f"view_report"):
-                                st.session_state.show_full_report = True
-                                st.rerun()
                 else:
                     st.info(f"节点{node_id}尚未执行")
 
@@ -2086,6 +2578,26 @@ def main():
             st.divider()
             st.subheader("完整报告")
 
+            # 在最终报告前添加成本统计
+            cost_info = orchestrator.get_cost_info()
+            if cost_info['formatted_summary'] != "成本追踪未启用":
+                # 显示成本信息
+                st.info(f"💡 本查询消耗了 **¥{cost_info['total_cost']:.4f}** 的 API 调用费用")
+
+                # 如果有 token 信息，也显示出来
+                if cost_info['total_tokens']:
+                    tokens = cost_info['total_tokens']
+                    prompt_tokens = tokens.get('prompt_tokens', 0) if isinstance(tokens, dict) else tokens.prompt_tokens if hasattr(tokens, 'prompt_tokens') else 0
+                    completion_tokens = tokens.get('completion_tokens', 0) if isinstance(tokens, dict) else tokens.completion_tokens if hasattr(tokens, 'completion_tokens') else 0
+                    total_tokens = tokens.get('total_tokens', 0) if isinstance(tokens, dict) else tokens.total_tokens if hasattr(tokens, 'total_tokens') else 0
+                    
+                    if prompt_tokens > 0 or completion_tokens > 0:
+                        st.caption(f"Token 消耗：提示 {prompt_tokens:,} + 补全 {completion_tokens:,} = 总计 {total_tokens:,}")
+
+                # 显示详细统计（在最终报告部分）
+                with st.expander("查看详细成本统计"):
+                    st.markdown(cost_info['formatted_summary'])
+
             tab1, tab2, tab3 = st.tabs(["最终报告", "详细信息", "下载"])
 
             with tab1:
@@ -2097,6 +2609,9 @@ def main():
                     for i, paper in enumerate(papers):
                         cite_idx = paper.get('cite_index', i+1)
                         title = paper.get('title', '') or '无标题'
+                        # 如果是反思补充的论文，在标题后添加 [反思补充]
+                        if paper.get('is_reflection_supplement', False):
+                            title += " [反思补充]"
                         title_display = title[:80] + ('...' if len(title) > 80 else '')
                         with st.expander(f"论文 {i+1}: {title_display}"):
                             col1, col2 = st.columns(2)
@@ -2180,13 +2695,22 @@ def display_node_result(node_id: int, result: Dict[str, Any], mode: str):
         if mode == "academic":
             papers = result.get("papers", [])
             st.write(f"**检索到论文数:** {len(papers)}")
-            for i, paper in enumerate(papers[:5]):
-                with st.expander(f"论文 {i+1}: {paper.get('title', '无标题')[:60]}"):
-                    st.write("**作者:**", paper.get('authors', '无'))
+            for i, paper in enumerate(papers):
+                title = paper.get('title', '无标题')
+                # 如果是反思补充的论文，在标题后添加 [反思补充]
+                if paper.get('is_reflection_supplement', False):
+                    title += " [反思补充]"
+                with st.expander(f"论文 {i+1}: {title[:60]}"):
+                    st.write("**作者:**", paper.get('authors', '未知作者'))
                     year = paper.get('year', 0)
                     st.write("**年份:**", str(year) if year > 0 else "未知年份")
                     journal = paper.get('journal', '')
                     st.write("**期刊:**", journal if journal else "未指定期刊")
+                    st.write("**标题:**", paper.get('title', '无标题'))
+                    abstract = paper.get('abstract', '') or '无摘要'
+                    if len(abstract) > 200:
+                        abstract = abstract[:197] + "..."
+                    st.write("**摘要:**", abstract)
             if len(papers) > 5:
                 st.caption(f"...还有 {len(papers) - 5} 篇论文")
         else:
@@ -2219,6 +2743,25 @@ def display_node_result(node_id: int, result: Dict[str, Any], mode: str):
         else:
             st.info(result.get("message", ""))
 
+    elif node_id == 4.5:
+        # 反思补充检索
+        if mode == "academic":
+            stats = result.get("stats", {})
+            comparison = result.get("comparison", {})
+            st.write(f"**补充检索状态:** {result.get('message', '未知')}")
+            st.write(f"**补充查询数:** {len(stats.get('supplement_queries', []))}")
+            st.write(f"**检索结果数:** {stats.get('search_count', 0)}")
+            st.write(f"**新增论文数:** {stats.get('new_papers_count', 0)}")
+            st.write(f"**文献数量变化:** {comparison.get('before', 0)} → {comparison.get('after', 0)} (+{comparison.get('increase', 0)})")
+
+            # 显示补充查询
+            if stats.get('supplement_queries'):
+                st.write("**补充查询:**")
+                for i, query in enumerate(stats.get('supplement_queries', [])):
+                    st.write(f"{i+1}. {query}")
+        else:
+            st.info(result.get("message", ""))
+
     elif node_id == 5:
         # 文献筛选与排序
         if mode == "academic":
@@ -2228,7 +2771,7 @@ def display_node_result(node_id: int, result: Dict[str, Any], mode: str):
                 with st.expander(f"{i+1}. {paper.get('title', '无标题')[:60]}"):
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.write("**标题:**", paper.get('title', ''))
+                        st.write("**标题:**", paper.get('title', '无标题'))
                         st.write("**作者:**", paper.get('authors', ''))
                     with col2:
                         year = paper.get('year', 0)

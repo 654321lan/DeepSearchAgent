@@ -81,14 +81,26 @@ class SummaryAgent(BaseAgent):
         return papers
 
     def _generate_table(self, papers: list) -> str:
-        """生成论文表格"""
+        """生成论文表格，只显示前15篇高质量文献"""
+        # 只取前15篇文献
+        display_papers = papers[:15]
         table = "| 标题 | 年份 | 证据等级 | 关键结论 |\n|------|------|----------|----------|\n"
-        for p in papers:
+        for p in display_papers:
             title_short = p['title'][:50] + ('...' if len(p['title']) > 50 else '')
+
+            # 如果是反思补充的论文，在标题后添加 [反思补充]
+            if p.get('is_reflection_supplement', False):
+                title_short += " [反思补充]"
+
             year = p['year']
             level = p['evidence_level']
             finding = p.get('key_finding', '')[:50] + ('...' if len(p.get('key_finding', '')) > 50 else '')
             table += f"| {title_short} | {year} | {level} | {finding} |\n"
+
+        # 如果总文献数超过15篇，添加注释
+        if len(papers) > 15:
+            table += f"\n*注：仅显示前15篇高质量文献，共检索到{len(papers)}篇相关文献*"
+
         return table
 
     def _generate_summary(self, query: str, papers: list) -> str:
@@ -101,7 +113,11 @@ class SummaryAgent(BaseAgent):
         papers_list = []
         for i, p in enumerate(papers, 1):
             paper_info = f"【文献{i}】\n"
-            paper_info += f"标题：{p.get('title', 'N/A')}\n"
+            # 如果是反思补充的论文，在标题后添加 [反思补充]
+            title = p.get('title', 'N/A')
+            if p.get('is_reflection_supplement', False):
+                title += " [反思补充]"
+            paper_info += f"标题：{title}\n"
             paper_info += f"GRADE分级：{p.get('evidence_level', 'N/A')}\n"
             paper_info += f"发布年份：{p.get('year', 'N/A')}\n"
             paper_info += f"摘要：{p.get('abstract', 'N/A')}"
