@@ -1,19 +1,10 @@
 # Deep Search Agent
 
-[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Zhipu](https://img.shields.io/badge/LLM-智谱%20GLM-blue)](https://open.bigmodel.cn/)
-[![Tavily](https://img.shields.io/badge/Search-Tavily-yellow.svg)](https://tavily.com/)
-[![OpenAlex](https://img.shields.io/badge/Academic-OpenAlex-orange)](https://openalex.org/)
 
 > 一个**无框架自研**的深度搜索 AI 代理，支持多轮反思检索与循证研究，重点针对医学健康场景完成学术模式落地。
 
-## 🎬 Demo 演示
 
-> [▶️ 点击观看完整演示视频](https://your-bilibili-link)  
-> *（2分钟录屏：展示循证研究模式从查询到生成报告的全流程）*
 
-![Demo Screenshot](https://github.com/666ghj/DeepSearchAgent-Demo/blob/main/img/1.png?raw=true)
 
 ## ✨ 核心亮点
 
