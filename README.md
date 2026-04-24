@@ -2,15 +2,16 @@
 
 
 > 一个**无框架**的深度搜索 AI 代理，支持多轮反思检索与循证研究，重点针对医学健康场景完成学术模式落地。
-> 场景描述：
+> 场景描述：面向日常健康困惑的普通用户。当用户听到“熬夜伤肝”“喝柠檬水能美白”这类说法时，Agent 不会直接给出笼统答案，而是自动检索 PubMed 等权威医学文献，分析现有证据是否充分、结论是否可靠，最终生成一份带文献溯源的循证报告——用事实替代“别人说”，让生活决策有据可依。
 
-## 🎬 Demo 演示
+## 📚 Demo 演示
 循证研究模式运行截图
-https://github.com/654321lan/DeepSearchAgent/blob/main/img/2.0.png?raw=true
-https://github.com/654321lan/DeepSearchAgent/blob/main/img/2.7.png?raw=true
+![循证研究模式](img/2.0.png)
+![循证研究模式](img/2.7.png)
 通用模式运行截图
-https://github.com/654321lan/DeepSearchAgent/blob/main/img/1.1.png?raw=true
-https://github.com/654321lan/DeepSearchAgent/blob/main/img/1.3.png?raw=true
+![通用模式](img/1.1.png)
+![通用模式](img/1.3.png)
+
 
 
 ## ✨ 核心亮点
