@@ -1,15 +1,16 @@
 # Deep Search Agent
 
 
-> 一个**无框架自研**的深度搜索 AI 代理，支持多轮反思检索与循证研究，重点针对医学健康场景完成学术模式落地。
+> 一个**无框架**的深度搜索 AI 代理，支持多轮反思检索与循证研究，重点针对医学健康场景完成学术模式落地。
+> 场景描述：
 
 ## 🎬 Demo 演示
-
-![循证研究模式运行截图](https://raw.githubusercontent.com/654321lan/DeepSearchAgent/main/img/2.1.png)
-![循证研究模式运行截图](https://raw.githubusercontent.com/654321lan/DeepSearchAgent/main/img/2.7.png)
-
-![通用模式运行截图](https://raw.githubusercontent.com/654321lan/DeepSearchAgent/main/img/1.1.png)
-![通用模式运行截图](https://raw.githubusercontent.com/654321lan/DeepSearchAgent/main/img/1.3.png)
+循证研究模式运行截图
+https://github.com/654321lan/DeepSearchAgent/blob/main/img/2.0.png?raw=true
+https://github.com/654321lan/DeepSearchAgent/blob/main/img/2.7.png?raw=true
+通用模式运行截图
+https://github.com/654321lan/DeepSearchAgent/blob/main/img/1.1.png?raw=true
+https://github.com/654321lan/DeepSearchAgent/blob/main/img/1.3.png?raw=true
 
 
 ## ✨ 核心亮点
